@@ -53,16 +53,35 @@ The revert step removes the subagent file, removes the rule block from
 
 | Path | Change |
 | --- | --- |
-| `~/.gemini/config/agents/safety-reviewer.md` | Created (overwritten on reinstall) |
-| `~/.gemini/GEMINI.md` | A marked block is appended |
+| `~/.gemini/config/agents/safety-reviewer.md` | Created (rewritten on reinstall) |
+| `~/.gemini/GEMINI.md` | A marked block is appended (rewritten in place on reinstall) |
+| `~/.gemini/GEMINI.md.auto-mode.bak` | Backup of your rule file |
 | `~/.gemini/antigravity-cli/settings.json` | Two keys are set |
 | `~/.gemini/antigravity-cli/settings.json.auto-mode.bak` | Backup of your settings |
+| `~/.gemini/antigravity-cli/auto-mode-state.json` | Records which files the installer created |
 
 The rule block sits between `<!-- BEGIN agy-auto-mode -->` and
 `<!-- END agy-auto-mode -->` markers. The rest of your `GEMINI.md` is not
 touched.
 
-If `settings.json` is not valid JSON, the installer stops and changes nothing.
+Backups are taken once, from your pristine files, and are left alone by a
+reinstall. The state file is what lets `--revert` tell a `settings.json` you
+already had from one the installer created: only the second kind is deleted.
+
+The installer reads and checks every file before it writes any of them, so bad
+input (`settings.json` that is not valid JSON, a `GEMINI.md` it cannot read, or
+one with mismatched markers) stops the run with nothing changed. Writes go to a
+temporary file and are renamed into place, so an interrupted run leaves either
+the old file or the new one, never half of either.
+
+## Tests
+
+```
+python3 -m unittest discover
+```
+
+The suite installs into throwaway directories; it never touches your real
+`~/.gemini`.
 
 ## License
 
