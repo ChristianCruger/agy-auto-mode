@@ -124,6 +124,12 @@ python3 -m unittest discover
 The suite installs into throwaway directories; it never touches your real
 `~/.gemini`.
 
+## Design notes
+
+[docs/review-notes.md](docs/review-notes.md) records the review that motivated
+the current implementation: what was wrong, what was fixed, and what is still
+open — including why the safety reviewer cannot block a command on its own.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
