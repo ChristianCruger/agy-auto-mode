@@ -1,0 +1,17 @@
+{
+  "jev-gate": {
+    "enabled": true,
+    "PreToolUse": [
+      {
+        "matcher": "run_command|send_command_input|shell_exec|write_to_file|replace_file_content|multi_replace_file_content|file_change|edit_notebook|write_blob|delete_directory|move|run_extension_code",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python C:\\Users\\YOU\\.gemini\\config\\hooks\\jev_gate.py",
+            "timeout": 20
+          }
+        ]
+      }
+    ]
+  }
+}

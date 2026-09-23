@@ -3,14 +3,24 @@
 setup_auto_mode.py
 ------------------
 One-step, zero-dependency installer for Google Antigravity (agy) Auto-Mode.
-Installs the Flash safety reviewer subagent, global GEMINI.md rule, and
-auto-proceed permissions across any PC, WSL, Linux, or macOS environment.
+
+Two engines:
+
+  jev (default)  A PreToolUse hook in ~/.gemini/config/hooks.json runs
+                 jev_gate.py before each state-changing tool call. TypeSafe's
+                 Jev model judges the call and the CLI enforces the decision.
+                 Permission settings are left alone: the gate's "allow" is
+                 what removes the prompt for routine work.
+  subagent       The original design: a Flash safety-reviewer subagent, a
+                 global GEMINI.md rule, and auto-proceed permissions. The
+                 review is advisory only.
 
 Usage:
-    python setup_auto_mode.py             # install
-    python setup_auto_mode.py --status    # report what is installed
-    python setup_auto_mode.py --dry-run   # show the changes, write nothing
-    python setup_auto_mode.py --revert    # undo the install
+    python setup_auto_mode.py                     # install the jev engine
+    python setup_auto_mode.py --engine subagent   # install the old engine
+    python setup_auto_mode.py --status            # report what is installed
+    python setup_auto_mode.py --dry-run           # show the changes, write nothing
+    python setup_auto_mode.py --revert            # undo either install
     # or in WSL/Linux: python3 setup_auto_mode.py
 """
 
@@ -19,6 +29,7 @@ import difflib
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 
@@ -27,9 +38,21 @@ ENV_GEMINI_DIR = "AGY_GEMINI_DIR"
 MARKER_BEGIN = "<!-- BEGIN agy-auto-mode -->"
 MARKER_END = "<!-- END agy-auto-mode -->"
 
-STATE_VERSION = 1
+# Version 1 state files predate engines and always mean the subagent engine.
+STATE_VERSION = 2
+
+ENGINE_JEV = "jev"
+ENGINE_SUBAGENT = "subagent"
+ENGINES = (ENGINE_JEV, ENGINE_SUBAGENT)
+DEFAULT_ENGINE = ENGINE_JEV
 
 DEFAULT_MODEL = "flash"
+
+HOOK_NAME = "jev-gate"
+HOOK_TIMEOUT = 20
+GATE_SOURCE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jev_gate.py")
+DEFAULT_PYTHON = "python" if os.name == "nt" else "python3"
+API_KEY_VAR = "TYPESAFE_API_KEY"
 
 AGENT_MD_TEMPLATE = """---
 name: safety-reviewer
@@ -142,6 +165,12 @@ class Paths:
         self.settings = os.path.join(self.cli_dir, "settings.json")
         self.backup = os.path.join(self.cli_dir, "settings.json.auto-mode.bak")
         self.state = os.path.join(self.cli_dir, "auto-mode-state.json")
+        # The jev engine. agy reads hooks.json from its global customization
+        # root, ~/.gemini/config/ (see agy's built-in agy-customizations docs).
+        self.hooks = os.path.join(gemini_dir, "config", "hooks.json")
+        self.gate_dir = os.path.join(gemini_dir, "config", "hooks")
+        self.gate = os.path.join(self.gate_dir, "jev_gate.py")
+        self.gate_env = os.path.join(self.gate_dir, "jev_gate.env")
 
 
 class Action:
@@ -235,6 +264,13 @@ def read_state(paths):
     return state if isinstance(state, dict) else None
 
 
+def state_engine(state):
+    """The engine a state record belongs to; version 1 records predate engines."""
+    if state is None:
+        return None
+    return state.get("engine", ENGINE_SUBAGENT)
+
+
 # --------------------------------------------------------------------------
 # GEMINI.md rule block
 # --------------------------------------------------------------------------
@@ -263,17 +299,208 @@ def find_block(content):
 
 
 # --------------------------------------------------------------------------
+# The jev engine: hooks.json entry, gate program, API key file
+# --------------------------------------------------------------------------
+
+def read_gate_source():
+    source = read_text(GATE_SOURCE)
+    if source is None:
+        raise AbortError(
+            "jev_gate.py was not found next to this script ({}).\n"
+            "    The jev engine installs a copy of it.".format(GATE_SOURCE)
+        )
+    return source
+
+
+def guarded_tools():
+    """The gate's own list of tools, so the matcher and the gate agree."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("_jev_gate_for_setup", GATE_SOURCE)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.GUARDED_TOOLS
+
+
+def hook_command(python_cmd, gate_path):
+    # agy runs the command through `cmd /c` on Windows. cmd strips the outer
+    # quotes when the line both starts and ends with one, so only the script
+    # path is ever quoted, never the interpreter.
+    if " " in gate_path:
+        gate_path = '"{}"'.format(gate_path)
+    return "{} {}".format(python_cmd, gate_path)
+
+
+def hook_spec(python_cmd, gate_path):
+    return {
+        "enabled": True,
+        "PreToolUse": [
+            {
+                "matcher": "|".join(guarded_tools()),
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": hook_command(python_cmd, gate_path),
+                        "timeout": HOOK_TIMEOUT,
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def read_hooks(paths):
+    """Return (raw, parsed) for hooks.json; parsed is None when absent."""
+    raw = read_text(paths.hooks)
+    return raw, parse_settings(paths.hooks, raw)
+
+
+def jev_present(paths):
+    _, hooks = read_hooks(paths)
+    return bool(hooks and HOOK_NAME in hooks) or os.path.exists(paths.gate)
+
+
+def subagent_present(paths):
+    if os.path.exists(paths.agent):
+        return True
+    rule_raw = read_text(paths.rule)
+    return rule_raw is not None and find_block(rule_raw) is not None
+
+
+def env_file_has_key(paths):
+    raw = read_text(paths.gate_env) or ""
+    for line in raw.splitlines():
+        key, _, value = line.partition("=")
+        if key.strip() == API_KEY_VAR and value.strip().strip("\"'"):
+            return True
+    return False
+
+
+def plan_install_jev(paths, python_cmd=DEFAULT_PYTHON):
+    """Plan the jev engine. Touches hooks.json, the gate, and the key file only."""
+    actions = []
+    notes = []
+
+    state = read_state(paths)
+    if state_engine(state) == ENGINE_SUBAGENT or subagent_present(paths):
+        raise AbortError(
+            "the subagent engine is installed.\n"
+            "    Run this script with --revert first, then install again."
+        )
+
+    gate_source = read_gate_source()
+    hooks_raw, hooks = read_hooks(paths)
+    created = set(state.get("created", [])) if state is not None else set()
+
+    # 1. The named hook, merged into whatever hooks.json already holds.
+    if hooks is None:
+        hooks = {}
+        created.add("hooks")
+    new_hooks = dict(hooks)
+    new_hooks[HOOK_NAME] = hook_spec(python_cmd, paths.gate)
+    new_hooks_raw = dump_json(new_hooks)
+    if new_hooks_raw == hooks_raw:
+        notes.append(" [=] Hook already up to date: {}".format(paths.hooks))
+    else:
+        verb = "Updated" if HOOK_NAME in hooks else "Added"
+        actions.append(Action("write", paths.hooks, new_hooks_raw,
+                              " [+] {} '{}' hook in: {}".format(verb, HOOK_NAME, paths.hooks)))
+
+    # 2. The gate program itself.
+    gate_raw = read_text(paths.gate)
+    if gate_raw == gate_source:
+        notes.append(" [=] Gate already up to date: {}".format(paths.gate))
+    else:
+        verb = "Installed" if gate_raw is None else "Updated"
+        actions.append(Action("write", paths.gate, gate_source,
+                              " [+] {} gate: {}".format(verb, paths.gate)))
+
+    # 3. The API key. agy starts hooks with its own environment, so the key
+    #    goes in a file next to the gate. An existing file is the user's.
+    if os.path.exists(paths.gate_env):
+        notes.append(" [=] Kept existing key file: {}".format(paths.gate_env))
+    elif os.environ.get(API_KEY_VAR):
+        # atomic_write goes through mkstemp, so on POSIX the file is 0600.
+        actions.append(Action(
+            "write", paths.gate_env,
+            "{}={}\n".format(API_KEY_VAR, os.environ[API_KEY_VAR]),
+            " [+] Saved {} from the environment to: {}".format(API_KEY_VAR, paths.gate_env)))
+        created.add("gate_env")
+    else:
+        notes.append(
+            " [!] No {} in the environment. Put it in {}\n"
+            "     as {}=<key>. Until then the gate denies every guarded tool call."
+            .format(API_KEY_VAR, paths.gate_env, API_KEY_VAR))
+
+    # 4. Record what we created, so --revert knows what it may delete.
+    state_raw = dump_json({
+        "version": STATE_VERSION,
+        "engine": ENGINE_JEV,
+        "python": python_cmd,
+        "created": sorted(created),
+    })
+    if state_raw != read_text(paths.state):
+        actions.append(Action("write", paths.state, state_raw, None))
+
+    return actions, notes
+
+
+def plan_revert_jev(paths, created):
+    """Remove the hook entry and the gate. Keep a key file the user made."""
+    actions = []
+    notes = []
+
+    hooks_raw, hooks = read_hooks(paths)
+    if not hooks or HOOK_NAME not in hooks:
+        notes.append(" [=] No '{}' hook in: {}".format(HOOK_NAME, paths.hooks))
+    else:
+        remaining = dict((k, v) for k, v in hooks.items() if k != HOOK_NAME)
+        if not remaining and "hooks" in created:
+            actions.append(Action("remove", paths.hooks,
+                                  message=" [-] Removed empty file: {}".format(paths.hooks)))
+        else:
+            actions.append(Action("write", paths.hooks, dump_json(remaining),
+                                  " [-] Removed '{}' hook from: {}".format(HOOK_NAME, paths.hooks)))
+
+    if os.path.exists(paths.gate):
+        actions.append(Action("remove", paths.gate,
+                              message=" [-] Removed gate: {}".format(paths.gate)))
+
+    if os.path.exists(paths.gate_env):
+        if "gate_env" in created:
+            actions.append(Action("remove", paths.gate_env,
+                                  message=" [-] Removed key file: {}".format(paths.gate_env)))
+        else:
+            notes.append(" [=] Kept your key file: {}".format(paths.gate_env))
+
+    return actions, notes
+
+
+# --------------------------------------------------------------------------
 # Planning
 # --------------------------------------------------------------------------
 
-def plan_install(paths, model=DEFAULT_MODEL):
+def plan_install(paths, model=DEFAULT_MODEL, engine=DEFAULT_ENGINE, python_cmd=DEFAULT_PYTHON):
     """Read and validate everything, then return (actions, notes).
 
-    Nothing is written during planning, so a bad GEMINI.md or settings.json
-    aborts the run with the config still untouched.
+    Nothing is written during planning, so a bad config file aborts the run
+    with the config still untouched.
     """
+    if engine == ENGINE_JEV:
+        return plan_install_jev(paths, python_cmd)
+    return plan_install_subagent(paths, model)
+
+
+def plan_install_subagent(paths, model=DEFAULT_MODEL):
+    """Plan the original engine: subagent, GEMINI.md rule, permissions."""
     actions = []
     notes = []
+
+    if jev_present(paths):
+        raise AbortError(
+            "the jev engine is installed.\n"
+            "    Run this script with --revert first, then install again."
+        )
 
     wanted_agent = agent_md(model)
     wanted_block = rule_block(model)
@@ -341,7 +568,11 @@ def plan_install(paths, model=DEFAULT_MODEL):
                               " [+] Configured auto-mode in: {}".format(paths.settings)))
 
     # 4. Record what we created, so --revert knows what it may delete.
-    state_raw = dump_json({"version": STATE_VERSION, "created": sorted(created)})
+    state_raw = dump_json({
+        "version": STATE_VERSION,
+        "engine": ENGINE_SUBAGENT,
+        "created": sorted(created),
+    })
     if state_raw != read_text(paths.state):
         actions.append(Action("write", paths.state, state_raw, None))
 
@@ -349,11 +580,40 @@ def plan_install(paths, model=DEFAULT_MODEL):
 
 
 def plan_revert(paths):
-    """Return (actions, notes) that undo an install."""
+    """Return (actions, notes) that undo an install of either engine.
+
+    With a state file, only the recorded engine is undone: a jev install never
+    set the permission keys, so its revert must not remove keys the user set.
+    Without one (a hand-made or very old install), both are cleaned up.
+    """
+    state = read_state(paths)
+    engine = state_engine(state)
+    created = set(state.get("created", [])) if state is not None else set()
+
+    actions = []
+    notes = []
+    if engine != ENGINE_JEV:
+        sub_actions, sub_notes = plan_revert_subagent(paths, state)
+        actions += sub_actions
+        notes += sub_notes
+    if engine != ENGINE_SUBAGENT:
+        jev_actions, jev_notes = plan_revert_jev(paths, created)
+        actions += jev_actions
+        notes += jev_notes
+
+    # The installer's own bookkeeping.
+    for path in (paths.backup, paths.rule_backup, paths.state):
+        if os.path.exists(path):
+            actions.append(Action("remove", path, message=None))
+
+    return actions, notes
+
+
+def plan_revert_subagent(paths, state):
+    """Undo the subagent engine: subagent file, rule block, permission keys."""
     actions = []
     notes = []
 
-    state = read_state(paths)
     if state is None:
         # A pre-state-file install, or none at all. A missing backup is the
         # only evidence that the installer created the file itself.
@@ -416,11 +676,6 @@ def plan_revert(paths):
                 actions.append(Action("write", paths.settings, restored_raw,
                                       " [-] Restored permissions in: {}".format(paths.settings)))
 
-    # 4. The installer's own bookkeeping.
-    for path in (paths.backup, paths.rule_backup, paths.state):
-        if os.path.exists(path):
-            actions.append(Action("remove", path, message=None))
-
     return actions, notes
 
 
@@ -469,11 +724,25 @@ def show_plan(actions):
             print("       " + line)
 
 
-def preflight():
-    """Warn, without failing, when the CLI this configures is not installed."""
+def preflight(engine=ENGINE_SUBAGENT, python_cmd=DEFAULT_PYTHON):
+    """Warn, without failing, about things the install cannot fix itself."""
     if shutil.which("agy") is None:
         print(" [!] 'agy' was not found on PATH. The files below will still be")
         print("     written, but check that this machine is where you want them.")
+    if engine != ENGINE_JEV:
+        return
+    # Run the check the way agy will run the hook: through the shell.
+    try:
+        result = subprocess.run(
+            '{} -c "import typesafe_sdk"'.format(python_cmd),
+            shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60,
+        )
+        importable = result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        importable = False
+    if not importable:
+        print(" [!] '{}' cannot import typesafe_sdk, so the gate will deny every".format(python_cmd))
+        print("     guarded tool call. Fix with: {} -m pip install typesafe-sdk".format(python_cmd))
 
 
 def run(paths, header, planner, footer, dry_run=False):
@@ -489,19 +758,24 @@ def run(paths, header, planner, footer, dry_run=False):
     print(footer)
 
 
-def install(paths, model=DEFAULT_MODEL, dry_run=False):
+def install(paths, model=DEFAULT_MODEL, dry_run=False, engine=DEFAULT_ENGINE,
+            python_cmd=DEFAULT_PYTHON):
     if not dry_run:
-        preflight()
-    run(
-        paths,
-        "[*] Setting up agy Auto-Mode with the {} safety reviewer...".format(model),
-        lambda p: plan_install(p, model),
-        "\n[OK] Auto-Mode setup complete. Confirmation prompts are off; the reviewer"
-        "\n     is advisory only -- see the warning in the README."
-        "\n     Check with: python setup_auto_mode.py --status"
-        "\n     Undo with:  python setup_auto_mode.py --revert",
-        dry_run=dry_run,
-    )
+        preflight(engine, python_cmd)
+    tail = ("\n     Check with: python setup_auto_mode.py --status"
+            "\n     Undo with:  python setup_auto_mode.py --revert")
+    if engine == ENGINE_JEV:
+        header = "[*] Setting up agy Auto-Mode with the Jev gate..."
+        footer = ("\n[OK] Jev gate installed. agy asks the gate before each state-changing"
+                  "\n     tool call: routine work runs without a prompt, risky calls are"
+                  "\n     blocked or put to you. The gate judges text, not effects --"
+                  "\n     see the README. Reload open agy sessions to pick it up." + tail)
+    else:
+        header = "[*] Setting up agy Auto-Mode with the {} safety reviewer...".format(model)
+        footer = ("\n[OK] Auto-Mode setup complete. Confirmation prompts are off; the reviewer"
+                  "\n     is advisory only -- see the warning in the README." + tail)
+    run(paths, header, lambda p: plan_install(p, model, engine, python_cmd), footer,
+        dry_run=dry_run)
 
 
 def revert(paths, dry_run=False):
@@ -518,8 +792,66 @@ OK, STALE, MISSING = "ok", "stale", "missing"
 _SYMBOL = {OK: "[+]", STALE: "[~]", MISSING: "[-]"}
 
 
-def check_status(paths, model=DEFAULT_MODEL):
-    """Return a list of (state, description) for the three installed pieces."""
+def installed_engine(paths):
+    """Which engine is on this machine: the state file first, then evidence."""
+    state = read_state(paths)
+    if state is not None:
+        return state_engine(state)
+    if jev_present(paths):
+        return ENGINE_JEV
+    if subagent_present(paths):
+        return ENGINE_SUBAGENT
+    return None
+
+
+def check_status(paths, model=DEFAULT_MODEL, engine=None, python_cmd=None):
+    """Return a list of (state, description) for the three installed pieces.
+
+    With no engine given, report on the one that is installed, or on the
+    default engine when neither is.
+    """
+    engine = engine or installed_engine(paths) or DEFAULT_ENGINE
+    if engine == ENGINE_JEV:
+        return check_status_jev(paths, python_cmd)
+    return check_status_subagent(paths, model)
+
+
+def check_status_jev(paths, python_cmd=None):
+    if python_cmd is None:
+        state = read_state(paths) or {}
+        python_cmd = state.get("python", DEFAULT_PYTHON)
+
+    _, hooks = read_hooks(paths)
+    entry = (hooks or {}).get(HOOK_NAME)
+    if entry is None:
+        hook = (MISSING, "'{}' hook not present in hooks.json".format(HOOK_NAME))
+    elif entry == hook_spec(python_cmd, paths.gate):
+        hook = (OK, "'{}' hook present in hooks.json".format(HOOK_NAME))
+    else:
+        hook = (STALE, "'{}' hook differs from this script's version".format(HOOK_NAME))
+
+    gate_raw = read_text(paths.gate)
+    if gate_raw is None:
+        gate = (MISSING, "gate not installed")
+    elif gate_raw == read_text(GATE_SOURCE):
+        gate = (OK, "gate installed")
+    else:
+        gate = (STALE, "gate differs from this repo's jev_gate.py")
+
+    if hook[0] == MISSING and gate[0] == MISSING:
+        # A key on its own is not an install; do not let it read as partial.
+        key = (MISSING, "API key not checked: nothing is installed")
+    elif env_file_has_key(paths):
+        key = (OK, "API key found in {}".format(os.path.basename(paths.gate_env)))
+    elif os.environ.get(API_KEY_VAR):
+        key = (OK, "API key found in the environment (agy must inherit it)")
+    else:
+        key = (MISSING, "no {}: the gate denies every guarded call".format(API_KEY_VAR))
+
+    return [hook, gate, key]
+
+
+def check_status_subagent(paths, model=DEFAULT_MODEL):
     agent_raw = read_text(paths.agent)
     if agent_raw is None:
         agent = (MISSING, "subagent not installed")
@@ -549,10 +881,11 @@ def check_status(paths, model=DEFAULT_MODEL):
     return [agent, rule, perms]
 
 
-def status(paths, model=DEFAULT_MODEL):
+def status(paths, model=DEFAULT_MODEL, engine=None, python_cmd=None):
     """Print what is installed. Returns the process exit code."""
-    print("[*] agy Auto-Mode status for {}".format(paths.gemini_dir))
-    states = check_status(paths, model)
+    engine = engine or installed_engine(paths) or DEFAULT_ENGINE
+    print("[*] agy Auto-Mode status ({} engine) for {}".format(engine, paths.gemini_dir))
+    states = check_status(paths, model, engine, python_cmd)
     for state, description in states:
         print(" {} {}".format(_SYMBOL[state], description))
     kinds = set(state for state, _ in states)
@@ -573,8 +906,10 @@ def status(paths, model=DEFAULT_MODEL):
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="setup_auto_mode.py",
-        description="Install or remove agy Auto-Mode: a safety-reviewer subagent, a "
-                    "global GEMINI.md rule, and auto-proceed permissions.",
+        description="Install or remove agy Auto-Mode. The jev engine (default) adds a "
+                    "PreToolUse hook that has TypeSafe's Jev model judge each state-changing "
+                    "tool call. The subagent engine adds an advisory Flash reviewer, a "
+                    "GEMINI.md rule, and auto-proceed permissions.",
         epilog="Exit codes: 0 success (for --status, fully installed), "
                "1 not installed or aborted, 2 partially installed.",
     )
@@ -583,8 +918,15 @@ def build_parser():
     mode.add_argument("--status", action="store_true", help="report what is currently installed")
     parser.add_argument("--dry-run", action="store_true",
                         help="show what would change, write nothing")
+    parser.add_argument("--engine", choices=ENGINES, default=None,
+                        help="what to install (default: {}); --status and --revert "
+                             "detect it".format(DEFAULT_ENGINE))
+    parser.add_argument("--python", default=None, metavar="CMD",
+                        help="jev engine: interpreter agy runs the gate with; it needs "
+                             "typesafe-sdk (default: {})".format(DEFAULT_PYTHON))
     parser.add_argument("--model", default=DEFAULT_MODEL, metavar="NAME",
-                        help="model the safety reviewer runs on (default: %(default)s)")
+                        help="subagent engine: model the safety reviewer runs on "
+                             "(default: %(default)s)")
     parser.add_argument("--gemini-dir", default=os.environ.get(ENV_GEMINI_DIR), metavar="DIR",
                         help="config directory to install into (default: ~/.gemini, "
                              "or ${})".format(ENV_GEMINI_DIR))
@@ -596,11 +938,13 @@ def main(argv=None):
     paths = Paths(gemini_dir=args.gemini_dir)
     try:
         if args.status:
-            return status(paths, args.model)
+            return status(paths, args.model, args.engine, args.python)
         if args.revert:
             revert(paths, dry_run=args.dry_run)
         else:
-            install(paths, model=args.model, dry_run=args.dry_run)
+            install(paths, model=args.model, dry_run=args.dry_run,
+                    engine=args.engine or DEFAULT_ENGINE,
+                    python_cmd=args.python or DEFAULT_PYTHON)
     except AbortError as exc:
         sys.stderr.write("[!] {}\n    Nothing was changed.\n".format(exc))
         return 1

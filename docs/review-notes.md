@@ -36,9 +36,35 @@ If neither exists, say so explicitly in the README — "we checked; `agy` has no
 enforcement hook as of version X" turns a disclaimer into a documented
 finding.
 
-**Status: open.** Neither could be checked — no `agy` on the machine the
-review ran on. The README now explains why the verdict cannot block on its
-own, but the enforcement point is still missing.
+**Status: done — the `jev` engine.** `agy` has a pre-tool-use hook. It is
+documented in the install itself, at
+`~/.gemini/antigravity/builtin/skills/agy-customizations/docs/hooks.md`:
+a `PreToolUse` handler in `~/.gemini/config/hooks.json` gets the tool call
+on stdin and returns `allow`, `ask`, `force_ask` or `deny`, and the CLI
+enforces it.
+
+The reviewer moved there, and changed model on the way. A second agent turn
+per tool call was the wrong shape for a gate: slow, and its output was prose
+that had to be parsed. [`jev_gate.py`](../jev_gate.py) asks TypeSafe's Jev
+model seven yes/no hazard questions and one severity scale in a single
+request, and a policy in code turns the probabilities into a decision. There
+is no verdict line left for a payload to forge.
+
+Verified end to end in the VS Code extension:
+
+- a write inside the workspace got `allow` and ran without a prompt;
+- a write to `~/Desktop` got `deny` (`escapes_workspace` p=0.99), agy showed
+  "Execution Denied by Pre-Tool Hook", and the file was not created;
+- with `toolPermission` back at its default, routine writes still ran without
+  a prompt. The gate's `allow` is enough, so the `jev` engine leaves the
+  permission settings alone, and the global "all prompts off" switch is gone.
+
+The first attempt put `hooks.json` in `~/.gemini/` in Claude Code's schema,
+guessed from strings in the binary. agy ignored it silently. The built-in
+docs had the right location and schema; read them first next time.
+
+What is left is the limit of any text judge: the gate sees `bash deploy.sh`,
+not what `deploy.sh` does. The README says so.
 
 Two prompt-level hardenings were cheap regardless:
 
@@ -123,20 +149,26 @@ meant `--revert --oops` silently ignored the typo.
 | `--model`, so a moved alias does not need a re-release | Done in `6f75a4c` |
 | Honest success message — the old one claimed more than the README did | Done in `6f75a4c` |
 | Preflight: warn when `agy` is not installed | Done in `6f75a4c`, non-fatal |
-| `--project` scope — everything is global, and the README's warning is about exactly that blast radius | **Partly.** `--gemini-dir` writes wherever it is pointed, but whether `agy` reads a project-local config directory was never verified |
+| `--project` scope — everything is global, and the README's warning is about exactly that blast radius | **Open, now possible.** `agy` reads `.agents/hooks.json` in a project, so the gate could be installed per project. The installer does not offer it yet |
 
 ---
 
 ## 4. Unverified
 
-No `agy` on the review machine, so everything was tested against the
-filesystem, not the CLI. Still unchecked:
+No `agy` on the original review machine, so everything was first tested
+against the filesystem, not the CLI. Since then, with `agy` installed:
 
-- that `toolPermission` and `artifactReviewPolicy` are the right key names,
-  and that `always-proceed` is the right value;
-- that the subagent frontmatter fields are accepted as written;
-- that `--model pro` names a real model;
-- whether `agy` reads a project-local config directory.
+- **Checked:** the subagent engine works as written. In a live session the
+  agent called `safety-reviewer` via `invoke_subagent` before `write_to_file`,
+  with the workspace root and verbatim arguments, and the reviewer returned
+  a verdict.
+- **Checked:** `agy` reads a project-local config directory: `.agents/` (or
+  `.agent/`, `_agents/`, `_agent/`), found by walking up from the working
+  directory to the repository root. Global config is `~/.gemini/config/`.
+- **Still unchecked:** that `--model pro` names a real model, and that the
+  CLI reads `toolPermission` and `artifactReviewPolicy` from
+  `antigravity-cli/settings.json` as named. The IDE extension keeps its own
+  permission setting, so the subagent engine's settings change may not
+  reach it at all. The `jev` engine does not depend on either.
 
-`--dry-run` before the first real install and `--status` after will surface
-most of this quickly.
+The `jev` engine was verified live; see item 1.
