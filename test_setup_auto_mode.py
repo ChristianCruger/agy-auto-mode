@@ -18,6 +18,31 @@ import unittest
 import setup_auto_mode as sam
 
 
+def plan_subagent(paths):
+    return sam.plan_install(paths, engine=sam.ENGINE_SUBAGENT)
+
+
+def plan_jev(paths):
+    return sam.plan_install(paths, engine=sam.ENGINE_JEV)
+
+
+def with_api_key(test, value):
+    """Set (or, with None, clear) TYPESAFE_API_KEY for one test."""
+    old = os.environ.get(sam.API_KEY_VAR)
+    if value is None:
+        os.environ.pop(sam.API_KEY_VAR, None)
+    else:
+        os.environ[sam.API_KEY_VAR] = value
+
+    def restore():
+        if old is None:
+            os.environ.pop(sam.API_KEY_VAR, None)
+        else:
+            os.environ[sam.API_KEY_VAR] = old
+
+    test.addCleanup(restore)
+
+
 class InstallerTestCase(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp(prefix="agy-auto-mode-test-")
@@ -41,7 +66,7 @@ class InstallerTestCase(unittest.TestCase):
             sam.apply_actions(actions)
 
     def install(self):
-        self.apply(sam.plan_install)
+        self.apply(plan_subagent)
 
     def revert(self):
         self.apply(sam.plan_revert)
@@ -72,7 +97,7 @@ class TestFreshInstall(InstallerTestCase):
     def test_install_is_idempotent(self):
         self.install()
         first = {path: self.read(os.path.join(self.root, path)) for path in self.files()}
-        actions, notes = sam.plan_install(self.paths)
+        actions, notes = plan_subagent(self.paths)
         self.assertEqual(actions, [])
         self.assertEqual(len(notes), 3)
         self.assertEqual({path: self.read(os.path.join(self.root, path)) for path in self.files()}, first)
@@ -177,12 +202,12 @@ class TestMarkerHandling(InstallerTestCase):
     def test_duplicate_begin_markers_abort(self):
         self.write(self.paths.rule, sam.rule_block() + "\n" + sam.rule_block())
         with self.assertRaises(sam.AbortError):
-            sam.plan_install(self.paths)
+            plan_subagent(self.paths)
 
     def test_unterminated_block_aborts(self):
         self.write(self.paths.rule, "# notes\n" + sam.MARKER_BEGIN + "\nrule\n")
         with self.assertRaises(sam.AbortError):
-            sam.plan_install(self.paths)
+            plan_subagent(self.paths)
 
     def test_revert_without_install_is_harmless(self):
         self.write(self.paths.rule, "# notes\n")
@@ -194,19 +219,19 @@ class TestAbortsBeforeWriting(InstallerTestCase):
     def test_malformed_settings_json_writes_nothing(self):
         self.write(self.paths.settings, '{"theme": "dark",}\n')
         with self.assertRaises(sam.AbortError):
-            sam.plan_install(self.paths)
+            plan_subagent(self.paths)
         self.assertFalse(os.path.exists(self.paths.agent))
 
     def test_non_object_settings_json_aborts(self):
         self.write(self.paths.settings, "[1, 2, 3]\n")
         with self.assertRaises(sam.AbortError):
-            sam.plan_install(self.paths)
+            plan_subagent(self.paths)
 
     def test_unreadable_rule_file_writes_nothing(self):
         """Regression: the subagent used to be written before this blew up."""
         os.makedirs(self.paths.rule)
         with self.assertRaises(sam.AbortError):
-            sam.plan_install(self.paths)
+            plan_subagent(self.paths)
         self.assertFalse(os.path.exists(self.paths.agent))
 
     def test_malformed_settings_json_does_not_stop_revert(self):
@@ -219,7 +244,7 @@ class TestAbortsBeforeWriting(InstallerTestCase):
 
 class TestModelFlag(InstallerTestCase):
     def test_model_reaches_both_files(self):
-        actions, _ = sam.plan_install(self.paths, model="pro")
+        actions, _ = sam.plan_install(self.paths, model="pro", engine=sam.ENGINE_SUBAGENT)
         with contextlib.redirect_stdout(io.StringIO()):
             sam.apply_actions(actions)
         self.assertIn("model: pro", self.read(self.paths.agent))
@@ -228,7 +253,7 @@ class TestModelFlag(InstallerTestCase):
 
     def test_changing_the_model_rewrites_the_install(self):
         self.install()
-        actions, _ = sam.plan_install(self.paths, model="pro")
+        actions, _ = sam.plan_install(self.paths, model="pro", engine=sam.ENGINE_SUBAGENT)
         with contextlib.redirect_stdout(io.StringIO()):
             sam.apply_actions(actions)
         self.assertIn('Model: "pro"', self.read(self.paths.rule))
@@ -237,7 +262,7 @@ class TestModelFlag(InstallerTestCase):
 
 class TestStatus(InstallerTestCase):
     def states(self, model=sam.DEFAULT_MODEL):
-        return [state for state, _ in sam.check_status(self.paths, model)]
+        return [state for state, _ in sam.check_status(self.paths, model, sam.ENGINE_SUBAGENT)]
 
     def test_reports_not_installed(self):
         self.assertEqual(self.states(), [sam.MISSING] * 3)
@@ -278,14 +303,14 @@ class TestDryRun(InstallerTestCase):
         return buffer.getvalue()
 
     def test_dry_run_install_writes_nothing(self):
-        output = self.plan_output(sam.plan_install)
+        output = self.plan_output(plan_subagent)
         self.assertIn("Would create", output)
         self.assertIn("lines)", output)
         self.assertEqual(self.files(), [])
 
     def test_dry_run_shows_a_diff_for_existing_files(self):
         self.write(self.paths.settings, '{"theme": "dark"}\n')
-        output = self.plan_output(sam.plan_install)
+        output = self.plan_output(plan_subagent)
         self.assertIn("Would update", output)
         self.assertIn('+  "toolPermission": "always-proceed",', output)
         self.assertEqual(self.settings(), {"theme": "dark"})
@@ -310,11 +335,23 @@ class TestCli(InstallerTestCase):
             code = sam.main(["--gemini-dir", self.paths.gemini_dir] + list(argv))
         return code, buffer.getvalue()
 
+    def setUp(self):
+        super(TestCli, self).setUp()
+        with_api_key(self, "sk-test")
+
     def test_install_then_status_then_revert(self):
+        for engine in sam.ENGINES:
+            self.assertEqual(self.cli("--engine", engine)[0], 0)
+            self.assertEqual(self.cli("--status")[0], 0)
+            self.assertEqual(self.cli("--revert")[0], 0)
+            self.assertEqual(self.cli("--status")[0], 1)
+            self.assertEqual(self.files(), [])
+
+    def test_default_engine_is_jev(self):
         self.assertEqual(self.cli()[0], 0)
-        self.assertEqual(self.cli("--status")[0], 0)
-        self.assertEqual(self.cli("--revert")[0], 0)
-        self.assertEqual(self.cli("--status")[0], 1)
+        self.assertTrue(os.path.exists(self.paths.hooks))
+        self.assertFalse(os.path.exists(self.paths.agent))
+        self.assertIn("(jev engine)", self.cli("--status")[1])
 
     def test_gemini_dir_comes_from_the_environment(self):
         os.environ[sam.ENV_GEMINI_DIR] = self.paths.gemini_dir
@@ -322,7 +359,7 @@ class TestCli(InstallerTestCase):
         buffer = io.StringIO()
         with contextlib.redirect_stdout(buffer):
             self.assertEqual(sam.main([]), 0)
-        self.assertTrue(os.path.exists(self.paths.agent))
+        self.assertTrue(os.path.exists(self.paths.hooks))
 
     def test_dry_run_via_cli_changes_nothing(self):
         code, output = self.cli("--dry-run")
@@ -333,6 +370,11 @@ class TestCli(InstallerTestCase):
     def test_malformed_settings_exits_one(self):
         self.write(self.paths.settings, "not json\n")
         with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.cli("--engine", "subagent")[0], 1)
+
+    def test_malformed_hooks_json_exits_one(self):
+        self.write(self.paths.hooks, "{oops\n")
+        with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(self.cli()[0], 1)
 
     def test_unknown_option_exits_two(self):
@@ -340,6 +382,145 @@ class TestCli(InstallerTestCase):
             with self.assertRaises(SystemExit) as caught:
                 sam.main(["--bogus"])
         self.assertEqual(caught.exception.code, 2)
+
+
+class TestJevEngine(InstallerTestCase):
+    def setUp(self):
+        super(TestJevEngine, self).setUp()
+        with_api_key(self, "sk-test")
+
+    def install(self):
+        self.apply(plan_jev)
+
+    def hooks(self):
+        return json.loads(self.read(self.paths.hooks))
+
+    def states(self, **kwargs):
+        return [s for s, _ in sam.check_status(self.paths, engine=sam.ENGINE_JEV, **kwargs)]
+
+    def test_install_writes_hook_gate_and_key(self):
+        self.install()
+        spec = self.hooks()[sam.HOOK_NAME]
+        self.assertTrue(spec["enabled"])
+        handler = spec["PreToolUse"][0]["hooks"][0]
+        self.assertIn(self.paths.gate, handler["command"])
+        self.assertEqual(handler["timeout"], sam.HOOK_TIMEOUT)
+        with open(sam.GATE_SOURCE, encoding="utf-8") as handle:
+            self.assertEqual(self.read(self.paths.gate), handle.read())
+        self.assertEqual(self.read(self.paths.gate_env), "TYPESAFE_API_KEY=sk-test\n")
+
+    def test_install_leaves_permissions_rule_and_subagent_alone(self):
+        self.install()
+        for path in (self.paths.settings, self.paths.rule, self.paths.agent):
+            self.assertFalse(os.path.exists(path), path)
+
+    def test_matcher_covers_the_gates_tools_only(self):
+        self.install()
+        matcher = self.hooks()[sam.HOOK_NAME]["PreToolUse"][0]["matcher"]
+        tools = matcher.split("|")
+        self.assertEqual(tuple(tools), sam.guarded_tools())
+        self.assertIn("write_to_file", tools)
+        self.assertIn("run_command", tools)
+        self.assertNotIn("view_file", tools)
+
+    def test_only_the_script_path_is_quoted(self):
+        command = sam.hook_command("python", r"C:\Users\A B\.gemini\config\hooks\jev_gate.py")
+        self.assertTrue(command.startswith("python "))
+        self.assertTrue(command.endswith('jev_gate.py"'))
+        self.assertEqual(sam.hook_command("python", "/h/jev_gate.py"), "python /h/jev_gate.py")
+
+    def test_install_is_idempotent(self):
+        self.install()
+        actions, _ = plan_jev(self.paths)
+        self.assertEqual(actions, [])
+
+    def test_revert_leaves_nothing_behind(self):
+        self.install()
+        self.revert()
+        self.assertEqual(self.files(), [])
+
+    def test_other_hooks_survive_install_and_revert(self):
+        other = {"lint": {"PostToolUse": [{"matcher": "run_command", "hooks": [{"command": "x"}]}]}}
+        self.write(self.paths.hooks, json.dumps(other))
+        self.install()
+        self.assertEqual(set(self.hooks()), {"lint", sam.HOOK_NAME})
+        self.revert()
+        self.assertEqual(self.hooks(), other)
+
+    def test_revert_keeps_permission_keys_the_user_set(self):
+        """A jev install never set them, so its revert must not remove them."""
+        settings = '{\n  "toolPermission": "always-proceed"\n}\n'
+        self.write(self.paths.settings, settings)
+        self.install()
+        self.revert()
+        self.assertEqual(self.read(self.paths.settings), settings)
+
+    def test_existing_key_file_is_kept_on_install_and_revert(self):
+        self.write(self.paths.gate_env, "TYPESAFE_API_KEY=mine\n")
+        self.install()
+        self.assertEqual(self.read(self.paths.gate_env), "TYPESAFE_API_KEY=mine\n")
+        self.revert()
+        self.assertEqual(self.read(self.paths.gate_env), "TYPESAFE_API_KEY=mine\n")
+
+    def test_missing_key_warns_and_reports_missing(self):
+        with_api_key(self, None)
+        actions, notes = plan_jev(self.paths)
+        self.assertTrue(any("[!]" in note and "TYPESAFE_API_KEY" in note for note in notes))
+        with contextlib.redirect_stdout(io.StringIO()):
+            sam.apply_actions(actions)
+        self.assertFalse(os.path.exists(self.paths.gate_env))
+        self.assertEqual(self.states(), [sam.OK, sam.OK, sam.MISSING])
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(sam.status(self.paths), 2)
+
+    def test_dry_run_never_prints_the_key(self):
+        buffer = io.StringIO()
+        actions, _ = plan_jev(self.paths)
+        with contextlib.redirect_stdout(buffer):
+            sam.show_plan(actions)
+        self.assertIn(self.paths.gate_env, buffer.getvalue())
+        self.assertNotIn("sk-test", buffer.getvalue())
+
+    def test_status_reports_installed_and_stale_gate(self):
+        self.assertEqual(self.states(), [sam.MISSING] * 3)
+        self.install()
+        self.assertEqual(self.states(), [sam.OK, sam.OK, sam.OK])
+        self.write(self.paths.gate, "# edited\n")
+        self.assertEqual(self.states()[1], sam.STALE)
+
+    def test_python_command_is_recorded_for_status(self):
+        self.apply(lambda p: sam.plan_install(p, engine=sam.ENGINE_JEV, python_cmd="py -3"))
+        command = self.hooks()[sam.HOOK_NAME]["PreToolUse"][0]["hooks"][0]["command"]
+        self.assertTrue(command.startswith("py -3 "))
+        self.assertEqual(self.states()[0], sam.OK)
+        self.assertEqual(self.states(python_cmd="python")[0], sam.STALE)
+
+    def test_jev_install_aborts_while_subagent_is_installed(self):
+        self.apply(plan_subagent)
+        with self.assertRaises(sam.AbortError):
+            plan_jev(self.paths)
+
+    def test_subagent_install_aborts_while_jev_is_installed(self):
+        self.install()
+        with self.assertRaises(sam.AbortError):
+            plan_subagent(self.paths)
+
+    def test_version_1_state_means_subagent(self):
+        self.write(self.paths.state, '{"version": 1, "created": []}\n')
+        self.assertEqual(sam.installed_engine(self.paths), sam.ENGINE_SUBAGENT)
+        with self.assertRaises(sam.AbortError):
+            plan_jev(self.paths)
+
+    def test_revert_without_state_cleans_a_hand_made_hook(self):
+        """The setup from the first manual test: hook and gate placed by hand."""
+        self.write(self.paths.hooks, json.dumps({sam.HOOK_NAME: {"PreToolUse": []}}))
+        self.write(self.paths.gate, "# hand copy\n")
+        self.write(self.paths.gate_env, "TYPESAFE_API_KEY=mine\n")
+        self.assertEqual(sam.installed_engine(self.paths), sam.ENGINE_JEV)
+        self.revert()
+        self.assertEqual(self.hooks(), {})
+        self.assertFalse(os.path.exists(self.paths.gate))
+        self.assertTrue(os.path.exists(self.paths.gate_env))
 
 
 class TestHardenedPrompts(InstallerTestCase):
