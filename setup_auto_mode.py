@@ -2,7 +2,8 @@
 """
 setup_auto_mode.py
 ------------------
-One-step, zero-dependency installer for Google Antigravity (agy) Auto-Mode.
+One-step, zero-dependency installer for Google Antigravity (agy) Auto-Mode,
+and for the same Jev gate in GitHub Copilot's VS Code agent mode.
 
 Two engines:
 
@@ -15,12 +16,20 @@ Two engines:
                  global GEMINI.md rule, and auto-proceed permissions. The
                  review is advisory only.
 
+Two targets:
+
+  agy (default)  Either engine, into ~/.gemini.
+  copilot        The jev engine only. ~/.copilot/hooks/jev-gate.json runs the
+                 gate with --copilot; VS Code's auto-approve settings are left
+                 alone, so the gate's "allow" is what removes the prompt.
+
 Usage:
     python setup_auto_mode.py                     # install the jev engine
     python setup_auto_mode.py --engine subagent   # install the old engine
     python setup_auto_mode.py --status            # report what is installed
     python setup_auto_mode.py --dry-run           # show the changes, write nothing
     python setup_auto_mode.py --revert            # undo either install
+    python setup_auto_mode.py --target copilot    # the Jev gate for Copilot
     # or in WSL/Linux: python3 setup_auto_mode.py
 """
 
@@ -34,6 +43,11 @@ import sys
 import tempfile
 
 ENV_GEMINI_DIR = "AGY_GEMINI_DIR"
+ENV_COPILOT_DIR = "AGY_COPILOT_DIR"
+
+TARGET_AGY = "agy"
+TARGET_COPILOT = "copilot"
+TARGETS = (TARGET_AGY, TARGET_COPILOT)
 
 MARKER_BEGIN = "<!-- BEGIN agy-auto-mode -->"
 MARKER_END = "<!-- END agy-auto-mode -->"
@@ -171,6 +185,24 @@ class Paths:
         self.gate_dir = os.path.join(gemini_dir, "config", "hooks")
         self.gate = os.path.join(self.gate_dir, "jev_gate.py")
         self.gate_env = os.path.join(self.gate_dir, "jev_gate.env")
+
+
+class CopilotPaths:
+    """Every file the Copilot target touches.
+
+    VS Code reads every *.json in ~/.copilot/hooks, so the hook gets a file of
+    its own and the gate lives outside that folder.
+    """
+
+    def __init__(self, copilot_dir=None):
+        if copilot_dir is None:
+            copilot_dir = os.path.join(os.path.expanduser("~"), ".copilot")
+        self.copilot_dir = copilot_dir
+        self.hook = os.path.join(copilot_dir, "hooks", "jev-gate.json")
+        self.gate_dir = os.path.join(copilot_dir, "jev-gate")
+        self.gate = os.path.join(self.gate_dir, "jev_gate.py")
+        self.gate_env = os.path.join(self.gate_dir, "jev_gate.env")
+        self.state = os.path.join(self.gate_dir, "install-state.json")
 
 
 class Action:
@@ -406,7 +438,24 @@ def plan_install_jev(paths, python_cmd=DEFAULT_PYTHON):
         actions.append(Action("write", paths.hooks, new_hooks_raw,
                               " [+] {} '{}' hook in: {}".format(verb, HOOK_NAME, paths.hooks)))
 
-    # 2. The gate program itself.
+    # 2 and 3. The gate program and the API key.
+    plan_gate_and_key(paths, gate_source, created, actions, notes)
+
+    # 4. Record what we created, so --revert knows what it may delete.
+    state_raw = dump_json({
+        "version": STATE_VERSION,
+        "engine": ENGINE_JEV,
+        "python": python_cmd,
+        "created": sorted(created),
+    })
+    if state_raw != read_text(paths.state):
+        actions.append(Action("write", paths.state, state_raw, None))
+
+    return actions, notes
+
+
+def plan_gate_and_key(paths, gate_source, created, actions, notes):
+    """Plan the gate copy and the key file. Shared by both targets."""
     gate_raw = read_text(paths.gate)
     if gate_raw == gate_source:
         notes.append(" [=] Gate already up to date: {}".format(paths.gate))
@@ -415,8 +464,8 @@ def plan_install_jev(paths, python_cmd=DEFAULT_PYTHON):
         actions.append(Action("write", paths.gate, gate_source,
                               " [+] {} gate: {}".format(verb, paths.gate)))
 
-    # 3. The API key. agy starts hooks with its own environment, so the key
-    #    goes in a file next to the gate. An existing file is the user's.
+    # The agent starts hooks with its own environment, so the key goes in a
+    # file next to the gate. An existing file is the user's.
     if os.path.exists(paths.gate_env):
         notes.append(" [=] Kept existing key file: {}".format(paths.gate_env))
     elif os.environ.get(API_KEY_VAR):
@@ -431,18 +480,6 @@ def plan_install_jev(paths, python_cmd=DEFAULT_PYTHON):
             " [!] No {} in the environment. Put it in {}\n"
             "     as {}=<key>. Until then the gate denies every guarded tool call."
             .format(API_KEY_VAR, paths.gate_env, API_KEY_VAR))
-
-    # 4. Record what we created, so --revert knows what it may delete.
-    state_raw = dump_json({
-        "version": STATE_VERSION,
-        "engine": ENGINE_JEV,
-        "python": python_cmd,
-        "created": sorted(created),
-    })
-    if state_raw != read_text(paths.state):
-        actions.append(Action("write", paths.state, state_raw, None))
-
-    return actions, notes
 
 
 def plan_revert_jev(paths, created):
@@ -472,6 +509,86 @@ def plan_revert_jev(paths, created):
                                   message=" [-] Removed key file: {}".format(paths.gate_env)))
         else:
             notes.append(" [=] Kept your key file: {}".format(paths.gate_env))
+
+    return actions, notes
+
+
+# --------------------------------------------------------------------------
+# The copilot target: a hook file of its own, the gate, the API key file
+# --------------------------------------------------------------------------
+
+def copilot_hook_spec(python_cmd, gate_path):
+    # VS Code hooks have no matcher, so the gate sees every tool call and
+    # picks out the ones it judges. --copilot selects Copilot's I/O shape.
+    return {
+        "hooks": {
+            "PreToolUse": [
+                {
+                    "type": "command",
+                    "command": hook_command(python_cmd, gate_path) + " --copilot",
+                    "timeout": HOOK_TIMEOUT,
+                }
+            ]
+        }
+    }
+
+
+def plan_install_copilot(paths, python_cmd=DEFAULT_PYTHON):
+    """Plan the Copilot install. Touches only files under ~/.copilot it owns."""
+    actions = []
+    notes = []
+
+    state = read_state(paths)
+    created = set(state.get("created", [])) if state is not None else set()
+    gate_source = read_gate_source()
+
+    hook_raw = read_text(paths.hook)
+    wanted = dump_json(copilot_hook_spec(python_cmd, paths.gate))
+    if hook_raw == wanted:
+        notes.append(" [=] Hook already up to date: {}".format(paths.hook))
+    else:
+        verb = "Added" if hook_raw is None else "Updated"
+        actions.append(Action("write", paths.hook, wanted,
+                              " [+] {} hook: {}".format(verb, paths.hook)))
+
+    plan_gate_and_key(paths, gate_source, created, actions, notes)
+
+    state_raw = dump_json({
+        "version": STATE_VERSION,
+        "engine": ENGINE_JEV,
+        "target": TARGET_COPILOT,
+        "python": python_cmd,
+        "created": sorted(created),
+    })
+    if state_raw != read_text(paths.state):
+        actions.append(Action("write", paths.state, state_raw, None))
+
+    return actions, notes
+
+
+def plan_revert_copilot(paths):
+    """Remove the hook file and the gate. Keep a key file the user made."""
+    actions = []
+    notes = []
+    state = read_state(paths)
+    created = set(state.get("created", [])) if state is not None else set()
+
+    if os.path.exists(paths.hook):
+        actions.append(Action("remove", paths.hook,
+                              message=" [-] Removed hook: {}".format(paths.hook)))
+    else:
+        notes.append(" [=] No hook at: {}".format(paths.hook))
+    if os.path.exists(paths.gate):
+        actions.append(Action("remove", paths.gate,
+                              message=" [-] Removed gate: {}".format(paths.gate)))
+    if os.path.exists(paths.gate_env):
+        if "gate_env" in created:
+            actions.append(Action("remove", paths.gate_env,
+                                  message=" [-] Removed key file: {}".format(paths.gate_env)))
+        else:
+            notes.append(" [=] Kept your key file: {}".format(paths.gate_env))
+    if os.path.exists(paths.state):
+        actions.append(Action("remove", paths.state, message=None))
 
     return actions, notes
 
@@ -724,14 +841,14 @@ def show_plan(actions):
             print("       " + line)
 
 
-def preflight(engine=ENGINE_SUBAGENT, python_cmd=DEFAULT_PYTHON):
+def preflight(engine=ENGINE_SUBAGENT, python_cmd=DEFAULT_PYTHON, target=TARGET_AGY):
     """Warn, without failing, about things the install cannot fix itself."""
-    if shutil.which("agy") is None:
+    if target == TARGET_AGY and shutil.which("agy") is None:
         print(" [!] 'agy' was not found on PATH. The files below will still be")
         print("     written, but check that this machine is where you want them.")
     if engine != ENGINE_JEV:
         return
-    # Run the check the way agy will run the hook: through the shell.
+    # Run the check the way the agent will run the hook: through the shell.
     try:
         result = subprocess.run(
             '{} -c "import typesafe_sdk"'.format(python_cmd),
@@ -783,6 +900,25 @@ def revert(paths, dry_run=False):
         "\n[OK] Auto-Mode removed.", dry_run=dry_run)
 
 
+def install_copilot(paths, dry_run=False, python_cmd=DEFAULT_PYTHON):
+    if not dry_run:
+        preflight(ENGINE_JEV, python_cmd, TARGET_COPILOT)
+    footer = ("\n[OK] Jev gate installed for Copilot. VS Code asks the gate before each"
+              "\n     tool call in agent mode: routine edits and commands run without a"
+              "\n     prompt, risky calls are blocked or put to you, and tools the gate"
+              "\n     does not judge keep VS Code's own approval. Hooks are a VS Code"
+              "\n     preview feature (chat.useHooks). Reload VS Code to pick it up."
+              "\n     Check with: python setup_auto_mode.py --target copilot --status"
+              "\n     Undo with:  python setup_auto_mode.py --target copilot --revert")
+    run(paths, "[*] Setting up the Jev gate for GitHub Copilot...",
+        lambda p: plan_install_copilot(p, python_cmd), footer, dry_run=dry_run)
+
+
+def revert_copilot(paths, dry_run=False):
+    run(paths, "[*] Removing the Jev gate from GitHub Copilot...", plan_revert_copilot,
+        "\n[OK] Jev gate removed. Reload VS Code to drop the hook.", dry_run=dry_run)
+
+
 # --------------------------------------------------------------------------
 # Status
 # --------------------------------------------------------------------------
@@ -830,25 +966,50 @@ def check_status_jev(paths, python_cmd=None):
     else:
         hook = (STALE, "'{}' hook differs from this script's version".format(HOOK_NAME))
 
+    gate = gate_status(paths)
+    return [hook, gate, key_status(paths, hook, gate, "agy")]
+
+
+def gate_status(paths):
     gate_raw = read_text(paths.gate)
     if gate_raw is None:
-        gate = (MISSING, "gate not installed")
-    elif gate_raw == read_text(GATE_SOURCE):
-        gate = (OK, "gate installed")
-    else:
-        gate = (STALE, "gate differs from this repo's jev_gate.py")
+        return (MISSING, "gate not installed")
+    if gate_raw == read_text(GATE_SOURCE):
+        return (OK, "gate installed")
+    return (STALE, "gate differs from this repo's jev_gate.py")
 
+
+def key_status(paths, hook, gate, agent):
     if hook[0] == MISSING and gate[0] == MISSING:
         # A key on its own is not an install; do not let it read as partial.
-        key = (MISSING, "API key not checked: nothing is installed")
-    elif env_file_has_key(paths):
-        key = (OK, "API key found in {}".format(os.path.basename(paths.gate_env)))
-    elif os.environ.get(API_KEY_VAR):
-        key = (OK, "API key found in the environment (agy must inherit it)")
-    else:
-        key = (MISSING, "no {}: the gate denies every guarded call".format(API_KEY_VAR))
+        return (MISSING, "API key not checked: nothing is installed")
+    if env_file_has_key(paths):
+        return (OK, "API key found in {}".format(os.path.basename(paths.gate_env)))
+    if os.environ.get(API_KEY_VAR):
+        return (OK, "API key found in the environment ({} must inherit it)".format(agent))
+    return (MISSING, "no {}: the gate denies every guarded call".format(API_KEY_VAR))
 
-    return [hook, gate, key]
+
+def check_status_copilot(paths, python_cmd=None):
+    if python_cmd is None:
+        state = read_state(paths) or {}
+        python_cmd = state.get("python", DEFAULT_PYTHON)
+
+    hook_raw = read_text(paths.hook)
+    if hook_raw is None:
+        hook = (MISSING, "hook not present in {}".format(os.path.dirname(paths.hook)))
+    else:
+        try:
+            current = json.loads(hook_raw)
+        except ValueError:
+            current = None
+        if current == copilot_hook_spec(python_cmd, paths.gate):
+            hook = (OK, "hook present: {}".format(os.path.basename(paths.hook)))
+        else:
+            hook = (STALE, "hook differs from this script's version")
+
+    gate = gate_status(paths)
+    return [hook, gate, key_status(paths, hook, gate, "VS Code")]
 
 
 def check_status_subagent(paths, model=DEFAULT_MODEL):
@@ -885,7 +1046,16 @@ def status(paths, model=DEFAULT_MODEL, engine=None, python_cmd=None):
     """Print what is installed. Returns the process exit code."""
     engine = engine or installed_engine(paths) or DEFAULT_ENGINE
     print("[*] agy Auto-Mode status ({} engine) for {}".format(engine, paths.gemini_dir))
-    states = check_status(paths, model, engine, python_cmd)
+    return print_status(check_status(paths, model, engine, python_cmd))
+
+
+def status_copilot(paths, python_cmd=None):
+    print("[*] Copilot Jev gate status for {}".format(paths.copilot_dir))
+    return print_status(check_status_copilot(paths, python_cmd))
+
+
+def print_status(states):
+    """Print the pieces and a summary line. Returns the process exit code."""
     for state, description in states:
         print(" {} {}".format(_SYMBOL[state], description))
     kinds = set(state for state, _ in states)
@@ -918,11 +1088,14 @@ def build_parser():
     mode.add_argument("--status", action="store_true", help="report what is currently installed")
     parser.add_argument("--dry-run", action="store_true",
                         help="show what would change, write nothing")
+    parser.add_argument("--target", choices=TARGETS, default=TARGET_AGY,
+                        help="the agent to install into (default: %(default)s); "
+                             "copilot supports the jev engine only")
     parser.add_argument("--engine", choices=ENGINES, default=None,
                         help="what to install (default: {}); --status and --revert "
                              "detect it".format(DEFAULT_ENGINE))
     parser.add_argument("--python", default=None, metavar="CMD",
-                        help="jev engine: interpreter agy runs the gate with; it needs "
+                        help="jev engine: interpreter the agent runs the gate with; it needs "
                              "typesafe-sdk (default: {})".format(DEFAULT_PYTHON))
     parser.add_argument("--model", default=DEFAULT_MODEL, metavar="NAME",
                         help="subagent engine: model the safety reviewer runs on "
@@ -930,11 +1103,16 @@ def build_parser():
     parser.add_argument("--gemini-dir", default=os.environ.get(ENV_GEMINI_DIR), metavar="DIR",
                         help="config directory to install into (default: ~/.gemini, "
                              "or ${})".format(ENV_GEMINI_DIR))
+    parser.add_argument("--copilot-dir", default=os.environ.get(ENV_COPILOT_DIR), metavar="DIR",
+                        help="copilot target: config directory to install into (default: "
+                             "~/.copilot, or ${})".format(ENV_COPILOT_DIR))
     return parser
 
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    if args.target == TARGET_COPILOT:
+        return main_copilot(args)
     paths = Paths(gemini_dir=args.gemini_dir)
     try:
         if args.status:
@@ -945,6 +1123,32 @@ def main(argv=None):
             install(paths, model=args.model, dry_run=args.dry_run,
                     engine=args.engine or DEFAULT_ENGINE,
                     python_cmd=args.python or DEFAULT_PYTHON)
+    except AbortError as exc:
+        sys.stderr.write("[!] {}\n    Nothing was changed.\n".format(exc))
+        return 1
+    except ApplyError as exc:
+        sys.stderr.write(
+            "[!] {}\n"
+            "    The install is incomplete. Fix the problem and run this script again.\n".format(exc)
+        )
+        return 1
+    return 0
+
+
+def main_copilot(args):
+    if args.engine == ENGINE_SUBAGENT:
+        sys.stderr.write("[!] The subagent engine is agy-only; the copilot target "
+                         "installs the jev engine.\n")
+        return 1
+    paths = CopilotPaths(copilot_dir=args.copilot_dir)
+    try:
+        if args.status:
+            return status_copilot(paths, args.python)
+        if args.revert:
+            revert_copilot(paths, dry_run=args.dry_run)
+        else:
+            install_copilot(paths, dry_run=args.dry_run,
+                            python_cmd=args.python or DEFAULT_PYTHON)
     except AbortError as exc:
         sys.stderr.write("[!] {}\n    Nothing was changed.\n".format(exc))
         return 1

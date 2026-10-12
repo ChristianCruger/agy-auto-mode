@@ -105,6 +105,59 @@ rewritten in place, and a key file you made yourself is never touched.
 To install the old engine instead: `python setup_auto_mode.py --engine subagent`.
 Only one engine can be installed at a time; `--revert` the other one first.
 
+## GitHub Copilot in VS Code
+
+The same gate also runs in Copilot's agent mode, through VS Code's agent
+hooks:
+
+```
+pip install typesafe-sdk
+export TYPESAFE_API_KEY=...        # PowerShell: $env:TYPESAFE_API_KEY = "..."
+python setup_auto_mode.py --target copilot
+```
+
+Then reload VS Code. `--status`, `--dry-run`, `--revert` and `--python` work
+the same way with `--target copilot`. Only the `jev` engine is available for
+Copilot.
+
+What is different from agy:
+
+- **The hook gets every tool call.** VS Code hooks have no matcher, so the
+  gate starts for reads too. It answers those within a fraction of a second
+  without calling Jev, and gives no decision, so VS Code's own approval
+  applies to them.
+- **Tool names are matched loosely.** VS Code does not document its tool
+  names, and releases spell them differently (`run_in_terminal`,
+  `runInTerminal`). The gate ignores case, underscores and dashes. The list
+  is `COPILOT_GUARDED_TOOLS` in `jev_gate.py`. With `JEV_GATE_AUDIT_LOG` set,
+  calls the gate does not judge are logged as well, so you can see the names
+  your version sends and add any that change state.
+- **Decisions map as follows:** `allow` → `allow`, `force_ask` → `ask`,
+  `deny` → `deny`. A crash in the gate exits with code 2, which makes VS Code
+  block the call; any other exit code would only be a warning.
+- **The workspace root is the hook's `cwd`.** With no `cwd`, the gate asks.
+- **The auto-approve settings are not changed.** The gate's `allow` is what
+  removes the prompt for routine work. If you turn on VS Code's global
+  auto-approve yourself, tools the gate does not judge run without a prompt,
+  and it is not documented whether a hook's `ask` still prompts.
+- **Hooks are a preview feature in VS Code.** They need `chat.useHooks`,
+  which is on by default. The format may still change.
+
+Files for `--target copilot`:
+
+| Path | Change |
+| --- | --- |
+| `~/.copilot/hooks/jev-gate.json` | The hook (rewritten on reinstall) |
+| `~/.copilot/jev-gate/jev_gate.py` | Copy of the gate (rewritten on reinstall) |
+| `~/.copilot/jev-gate/jev_gate.env` | Your API key, only if absent and the key is in the environment |
+| `~/.copilot/jev-gate/install-state.json` | Records which files the installer created |
+
+The gate sits outside `~/.copilot/hooks/` because VS Code reads every JSON
+file in that folder as a hook file. `--copilot-dir DIR` (or
+`$AGY_COPILOT_DIR`) installs into another directory.
+[docs/copilot-hooks.example.json](docs/copilot-hooks.example.json) shows the
+hook file, for a manual install.
+
 ## Uninstall
 
 ```
@@ -121,12 +174,14 @@ settings.
 
 | Flag | Effect |
 | --- | --- |
+| `--target agy\|copilot` | The agent to install into (default: `agy`) |
 | `--engine jev\|subagent` | What to install (default: `jev`) |
 | `--status` | Report what is installed, without changing anything |
 | `--dry-run` | Show the changes an install or revert would make, and write nothing |
 | `--python CMD` | `jev`: the interpreter agy runs the gate with (default: `python`, or `python3` off Windows). It needs `typesafe-sdk` |
 | `--model NAME` | `subagent`: run the reviewer on a different model (default: `flash`) |
 | `--gemini-dir DIR` | Install into another config directory instead of `~/.gemini` |
+| `--copilot-dir DIR` | `copilot`: install into another directory instead of `~/.copilot` |
 | `--revert` | Undo the install |
 
 `--gemini-dir` also reads `$AGY_GEMINI_DIR`.

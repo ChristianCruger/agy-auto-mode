@@ -12,6 +12,7 @@ import io
 import json
 import os
 import shutil
+import sys
 import tempfile
 import unittest
 
@@ -209,6 +210,104 @@ class MainTestCase(unittest.TestCase):
             self.assertIn(qid, policy.deny_at)
             self.assertIn(qid, policy.ask_at)
             self.assertLess(policy.ask_at[qid], policy.deny_at[qid])
+
+
+def copilot_event(name="run_in_terminal", tool_input=None, cwd="/w"):
+    """A PreToolUse payload in VS Code's snake_case shape."""
+    event = {
+        "timestamp": "2026-10-12T20:00:00Z",
+        "hook_event_name": "PreToolUse",
+        "session_id": "s1",
+        "tool_name": name,
+        "tool_input": tool_input if tool_input is not None else
+        {"command": "pytest -q", "explanation": "run tests", "isBackground": False},
+        "tool_use_id": "t1",
+    }
+    if cwd is not None:
+        event["cwd"] = cwd
+    return event
+
+
+class CopilotTestCase(unittest.TestCase):
+    def run_main(self, raw, asker=None):
+        out = io.StringIO()
+        original = gate.ask_jev
+        if asker is not None:
+            gate.ask_jev = asker
+            self.addCleanup(setattr, gate, "ask_jev", original)
+        code = gate.main(["--copilot"], stdin=io.StringIO(raw), stdout=out)
+        return code, json.loads(out.getvalue())
+
+    def test_cwd_is_the_workspace_root(self):
+        state = gate.build_state(copilot_event(), gate.TARGET_COPILOT)
+        self.assertEqual(state["workspace_root"], "/w")
+        self.assertEqual(state["tool"], "run_in_terminal")
+        self.assertEqual(state["arguments"]["command"], "pytest -q")
+
+    def test_agy_target_does_not_treat_cwd_as_the_root(self):
+        self.assertEqual(gate.build_state(copilot_event())["workspace_root"], "")
+
+    def test_tool_names_match_in_any_spelling(self):
+        tools = gate.COPILOT_GUARDED_TOOLS
+        for name in ("run_in_terminal", "runInTerminal", "RunInTerminal",
+                     "replaceStringInFile", "create-file", "editFiles"):
+            self.assertTrue(gate.is_guarded(name, tools), name)
+        for name in ("read_file", "readFile", "grep_search", "", None):
+            self.assertFalse(gate.is_guarded(name, tools), name)
+
+    def test_allow_maps_to_permission_decision(self):
+        code, out = self.run_main(json.dumps(copilot_event()), lambda s: answers())
+        self.assertEqual(code, 0)
+        hso = out["hookSpecificOutput"]
+        self.assertEqual(hso["hookEventName"], "PreToolUse")
+        self.assertEqual(hso["permissionDecision"], "allow")
+        self.assertTrue(hso["permissionDecisionReason"].startswith("Jev gate: "))
+
+    def test_deny_maps_to_deny(self):
+        _, out = self.run_main(json.dumps(copilot_event()),
+                               lambda s: answers(destructive=0.95))
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_force_ask_maps_to_ask(self):
+        _, out = self.run_main(json.dumps(copilot_event()),
+                               lambda s: answers(destructive=0.5))
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "ask")
+
+    def test_unguarded_tool_gives_no_decision(self):
+        """A read must reach Copilot's own approval, not a prompt from us."""
+        called = []
+        _, out = self.run_main(
+            json.dumps(copilot_event("read_file", {"filePath": "/w/a.py"})),
+            lambda s: called.append(s) or answers())
+        self.assertEqual(out, {})
+        self.assertEqual(called, [])
+
+    def test_unreadable_event_denies(self):
+        code, out = self.run_main("not json")
+        self.assertEqual(code, 0)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_missing_cwd_asks(self):
+        _, out = self.run_main(json.dumps(copilot_event(cwd=None)), lambda s: answers())
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "ask")
+
+    def test_a_crash_exits_two_so_copilot_blocks(self):
+        original = gate.review
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("bug")
+
+        gate.review = boom
+        self.addCleanup(setattr, gate, "review", original)
+        err = io.StringIO()
+        old_err, sys.stderr = sys.stderr, err
+        try:
+            code = gate.main(["--copilot"], stdin=io.StringIO(json.dumps(copilot_event())),
+                             stdout=io.StringIO())
+        finally:
+            sys.stderr = old_err
+        self.assertEqual(code, 2)
+        self.assertIn("blocked", err.getvalue())
 
 
 class AuditTestCase(unittest.TestCase):

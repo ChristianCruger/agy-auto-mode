@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""A PreToolUse gate for the agy CLI, backed by TypeSafe's Jev model.
+"""A PreToolUse gate for agy and GitHub Copilot, backed by TypeSafe's Jev model.
 
-agy runs this program before a state-changing tool call. It reads the hook
+The agent runs this program before a state-changing tool call. It reads the hook
 event on stdin, asks Jev one batch of typed questions about the proposed
 action, applies a policy written in code, and prints a permission decision on
 stdout.
@@ -20,6 +20,20 @@ Hook contract (agy's built-in agy-customizations/docs/hooks.md):
   "allow" skips the user's permission prompt, so it is only returned for an
   action Jev judged; everything else gets ask, force_ask, or deny.
 
+Copilot contract, with --copilot (VS Code agent hooks, a preview feature):
+
+* Location: ~/.copilot/hooks/*.json. A top-level "hooks" object maps event
+  names to command entries. There is no matcher: every tool call reaches the
+  gate, and the gate filters by name itself.
+* Input: snake_case JSON on stdin -- tool_name, tool_input, tool_use_id, and
+  an optional cwd, which is the workspace folder.
+* Output: {"hookSpecificOutput": {"hookEventName": "PreToolUse",
+  "permissionDecision": allow|deny|ask, "permissionDecisionReason": ...}}.
+  agy's "ask" means "normal permission handling", so it becomes an empty
+  object; agy's "force_ask" becomes Copilot's "ask".
+* Exit code 2 blocks the call; any other non-zero code is only a warning, so
+  a crash in --copilot mode exits 2.
+
 Design notes:
 
 * Jev returns probabilities, not prose. There is no verdict line to parse and
@@ -34,6 +48,7 @@ This is not a sandbox. Jev judges the text of the action, not its effects.
 
 Usage:
     jev_gate.py                 read a hook event on stdin (how agy calls it)
+    jev_gate.py --copilot       the same, in Copilot's input and output shape
     jev_gate.py --check FILE    judge one saved event and print the reasoning
     jev_gate.py --dump-questions  print the question battery as JSON
 """
@@ -63,6 +78,40 @@ GUARDED_TOOLS = (
     "move",
     "run_extension_code",
 )
+
+#: Copilot's tools that change state. VS Code does not document its tool names,
+#: and releases spell them differently (run_in_terminal, runInTerminal), so
+#: is_guarded() compares them with case, underscores and dashes ignored. The
+#: last group is Copilot CLI's spelling. Set JEV_GATE_AUDIT_LOG to see the
+#: names your version actually sends.
+COPILOT_GUARDED_TOOLS = (
+    "run_in_terminal",
+    "run_terminal_command",
+    "send_to_terminal",
+    "create_file",
+    "create_directory",
+    "delete_file",
+    "replace_string_in_file",
+    "multi_replace_string_in_file",
+    "insert_edit_into_file",
+    "apply_patch",
+    "edit_files",
+    "edit_notebook_file",
+    "create_new_jupyter_notebook",
+    "run_notebook_cell",
+    "run_task",
+    "create_and_run_task",
+    "run_vscode_command",
+    "install_extension",
+    "create_new_workspace",
+    "bash",
+    "powershell",
+    "edit",
+    "create",
+)
+
+TARGET_AGY = "agy"
+TARGET_COPILOT = "copilot"
 
 #: Optional KEY=VALUE file next to this script, for TYPESAFE_API_KEY. agy runs
 #: hooks with its own environment, which may not carry the key.
@@ -176,8 +225,11 @@ HAZARDS = {
             "true": (
                 "Editing or deleting hooks.json, this gate program, the GEMINI.md "
                 "rule block, the safety-reviewer subagent, or the agy permission "
-                "settings; unsetting the review's API key; or invoking agy again "
-                "with permission checks switched off."
+                "settings; editing or deleting a file under ~/.copilot/hooks or "
+                "~/.copilot/jev-gate, or changing VS Code's chat.useHooks or "
+                "chat.tools.* auto-approve settings; unsetting the review's API "
+                "key; or invoking agy or Copilot again with permission checks "
+                "switched off."
             ),
             "false": (
                 "Ordinary edits to project files that have nothing to do with the "
@@ -392,7 +444,17 @@ def tool_args(event):
     return event.get("tool_input", event.get("toolInput"))
 
 
-def build_state(event):
+def _norm(name):
+    return "".join(c for c in (name or "").lower() if c not in "_- ")
+
+
+def is_guarded(name, tools):
+    """Whether the gate judges this tool. Spelling differences are ignored."""
+    wanted = _norm(name)
+    return bool(wanted) and any(_norm(tool) == wanted for tool in tools)
+
+
+def build_state(event, target=TARGET_AGY):
     """The state Jev judges. Named fields, because the context has parts.
 
     The tool arguments go in verbatim. A review of a paraphrase reviews
@@ -400,6 +462,7 @@ def build_state(event):
 
     agy sends workspacePaths (a list) and no cwd; run_command carries its own
     Cwd argument. With several workspace folders, all of them are in bounds.
+    Copilot sends no root at all; its cwd is the workspace folder.
     """
     args = tool_args(event)
     paths = event.get("workspacePaths")
@@ -407,6 +470,8 @@ def build_state(event):
         roots = [p for p in paths if isinstance(p, str) and p]
     else:
         root = _first(event, "workspace_root", "workspaceRoot")
+        if not root and target == TARGET_COPILOT:
+            root = _first(event, "cwd")
         roots = [root] if root else []
     cwd = ""
     if isinstance(args, dict):
@@ -420,10 +485,27 @@ def build_state(event):
     }
 
 
-def emit(decision, reason, stream=None):
-    """Print the decision in the shape agy's PreToolUse contract expects."""
+#: agy decision -> Copilot permissionDecision. None means no opinion: the tool
+#: goes through Copilot's own approval, as agy's "ask" does in agy.
+COPILOT_DECISIONS = {"allow": "allow", "deny": "deny", "force_ask": "ask", "ask": None}
+
+
+def emit(decision, reason, stream=None, target=TARGET_AGY):
+    """Print the decision in the shape the target's PreToolUse contract expects."""
     stream = stream or sys.stdout
-    json.dump({"decision": decision, "reason": "Jev gate: " + reason}, stream)
+    reason = "Jev gate: " + reason
+    if target == TARGET_COPILOT:
+        mapped = COPILOT_DECISIONS.get(decision, "deny")
+        payload = {}
+        if mapped is not None:
+            payload["hookSpecificOutput"] = {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": mapped,
+                "permissionDecisionReason": reason,
+            }
+    else:
+        payload = {"decision": decision, "reason": reason}
+    json.dump(payload, stream)
     stream.write("\n")
 
 
@@ -483,13 +565,18 @@ def ask_jev(state, model=None, timeout=None):
     return answers
 
 
-def review(event, policy=None, asker=ask_jev):
+def review(event, policy=None, asker=None, target=TARGET_AGY):
     """Judge one event. Any failure becomes a denial, with the cause named."""
-    state = build_state(event)
-    if tool_name(event) not in GUARDED_TOOLS:
-        # Not ours to judge. "ask" defers to agy's normal permission handling;
-        # "allow" would silently skip the user's prompt for a tool nobody saw.
-        return "ask", "%s is not judged by this gate" % (tool_name(event) or "an unnamed tool"), {}
+    asker = asker or ask_jev
+    state = build_state(event, target)
+    tools = COPILOT_GUARDED_TOOLS if target == TARGET_COPILOT else GUARDED_TOOLS
+    if not is_guarded(tool_name(event), tools):
+        # Not ours to judge. "ask" defers to the agent's normal permission
+        # handling; "allow" would silently skip the prompt for a tool nobody
+        # saw. Logged, so the tool list can be checked against real names.
+        reason = "%s is not judged by this gate" % (tool_name(event) or "an unnamed tool")
+        audit({"state": state, "decision": "ask", "reason": reason})
+        return "ask", reason, {}
     if not state["workspace_root"]:
         # The old prompt returned CAUTION here. In code it can be stricter:
         # without a root there is no boundary, so no path claim can be checked.
@@ -510,7 +597,19 @@ def main(argv=None, stdin=None, stdout=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     stdin = stdin or sys.stdin
     stdout = stdout or sys.stdout
+    if "--copilot" in argv:
+        argv.remove("--copilot")
+        try:
+            return _main(argv, stdin, stdout, TARGET_COPILOT)
+        except Exception as exc:  # noqa: BLE001
+            # Copilot runs the call anyway after any exit code but 2.
+            sys.stderr.write("Jev gate failed, so the call is blocked: %s: %s\n"
+                             % (type(exc).__name__, exc))
+            return 2
+    return _main(argv, stdin, stdout, TARGET_AGY)
 
+
+def _main(argv, stdin, stdout, target):
     if argv and argv[0] == "--dump-questions":
         json.dump(questions_as_json(), stdout, indent=2)
         stdout.write("\n")
@@ -533,10 +632,10 @@ def main(argv=None, stdin=None, stdout=None):
     try:
         event = parse_event(raw)
     except Exception as exc:  # noqa: BLE001
-        emit("deny", "the hook event could not be read (%s)" % exc, stdout)
+        emit("deny", "the hook event could not be read (%s)" % exc, stdout, target)
         return 0
 
-    decision, reason, detail = review(event, policy)
+    decision, reason, detail = review(event, policy, target=target)
     if explain:
         json.dump(
             {"decision": decision, "reason": reason, "answers": detail},
@@ -546,7 +645,7 @@ def main(argv=None, stdin=None, stdout=None):
         )
         stdout.write("\n")
     else:
-        emit(decision, reason, stdout)
+        emit(decision, reason, stdout, target)
     return 0
 
 
