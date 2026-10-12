@@ -146,9 +146,10 @@ What is different from agy:
 **Copilot CLI** reads the same `~/.copilot/hooks/` folder, so the install
 covers it too. It sends Claude-style tool names (`Bash`, `Write`, `Edit`),
 which the gate's list includes, and it reads the decision from the top level
-of the reply, which the gate also writes. Two CLI differences: a hook that
-times out lets the call run, and `ask` is treated as `deny` under the cloud
-agent.
+of the reply, which the gate also writes. The gate's `deny` and `ask` hold
+even under `--allow-all-tools`; in a non-interactive `-p` run nobody can
+answer an `ask`, so the CLI denies the call. A hook that times out lets the
+call run, and the cloud agent treats `ask` as `deny`.
 
 Files for `--target copilot`:
 
