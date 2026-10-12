@@ -250,9 +250,11 @@ class CopilotTestCase(unittest.TestCase):
     def test_tool_names_match_in_any_spelling(self):
         tools = gate.COPILOT_GUARDED_TOOLS
         for name in ("run_in_terminal", "runInTerminal", "RunInTerminal",
-                     "replaceStringInFile", "create-file", "editFiles"):
+                     "replaceStringInFile", "create-file", "editFiles",
+                     "Bash", "Write", "Edit", "powershell"):
             self.assertTrue(gate.is_guarded(name, tools), name)
-        for name in ("read_file", "readFile", "grep_search", "", None):
+        for name in ("read_file", "readFile", "grep_search", "Read", "Grep",
+                     "view", "", None):
             self.assertFalse(gate.is_guarded(name, tools), name)
 
     def test_allow_maps_to_permission_decision(self):
@@ -262,6 +264,9 @@ class CopilotTestCase(unittest.TestCase):
         self.assertEqual(hso["hookEventName"], "PreToolUse")
         self.assertEqual(hso["permissionDecision"], "allow")
         self.assertTrue(hso["permissionDecisionReason"].startswith("Jev gate: "))
+        # Copilot CLI reads the top-level copy.
+        self.assertEqual(out["permissionDecision"], "allow")
+        self.assertEqual(out["permissionDecisionReason"], hso["permissionDecisionReason"])
 
     def test_deny_maps_to_deny(self):
         _, out = self.run_main(json.dumps(copilot_event()),

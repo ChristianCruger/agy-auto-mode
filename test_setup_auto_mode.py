@@ -552,6 +552,7 @@ class TestCopilotTarget(InstallerTestCase):
     def test_install_writes_hook_gate_and_key(self):
         self.install()
         hook = json.loads(self.read(self.cp.hook))
+        self.assertEqual(hook["version"], 1)
         handler = hook["hooks"]["PreToolUse"][0]
         self.assertEqual(handler["type"], "command")
         self.assertIn(self.cp.gate, handler["command"])

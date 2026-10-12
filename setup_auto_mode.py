@@ -520,7 +520,9 @@ def plan_revert_jev(paths, created):
 def copilot_hook_spec(python_cmd, gate_path):
     # VS Code hooks have no matcher, so the gate sees every tool call and
     # picks out the ones it judges. --copilot selects Copilot's I/O shape.
+    # Copilot CLI reads the same file and requires "version": 1.
     return {
+        "version": 1,
         "hooks": {
             "PreToolUse": [
                 {

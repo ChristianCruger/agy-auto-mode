@@ -33,6 +33,10 @@ Copilot contract, with --copilot (VS Code agent hooks, a preview feature):
   object; agy's "force_ask" becomes Copilot's "ask".
 * Exit code 2 blocks the call; any other non-zero code is only a warning, so
   a crash in --copilot mode exits 2.
+* Copilot CLI reads the same ~/.copilot/hooks files. It documents the
+  decision at the top level, not under hookSpecificOutput, so both are
+  written. With the PascalCase event name it reports Claude-style tool names
+  (Bash, Write, Edit).
 
 Design notes:
 
@@ -82,8 +86,9 @@ GUARDED_TOOLS = (
 #: Copilot's tools that change state. VS Code does not document its tool names,
 #: and releases spell them differently (run_in_terminal, runInTerminal), so
 #: is_guarded() compares them with case, underscores and dashes ignored. The
-#: last group is Copilot CLI's spelling. Set JEV_GATE_AUDIT_LOG to see the
-#: names your version actually sends.
+#: last groups are Copilot CLI's spellings, its own and the Claude-style ones
+#: it sends to a PascalCase hook. Set JEV_GATE_AUDIT_LOG to see the names
+#: your version actually sends.
 COPILOT_GUARDED_TOOLS = (
     "run_in_terminal",
     "run_terminal_command",
@@ -108,6 +113,10 @@ COPILOT_GUARDED_TOOLS = (
     "powershell",
     "edit",
     "create",
+    "str_replace_editor",
+    "write",
+    "multi_edit",
+    "notebook_edit",
 )
 
 TARGET_AGY = "agy"
@@ -498,6 +507,9 @@ def emit(decision, reason, stream=None, target=TARGET_AGY):
         mapped = COPILOT_DECISIONS.get(decision, "deny")
         payload = {}
         if mapped is not None:
+            # VS Code reads the nested form, Copilot CLI the top-level one.
+            payload["permissionDecision"] = mapped
+            payload["permissionDecisionReason"] = reason
             payload["hookSpecificOutput"] = {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": mapped,

@@ -143,6 +143,13 @@ What is different from agy:
 - **Hooks are a preview feature in VS Code.** They need `chat.useHooks`,
   which is on by default. The format may still change.
 
+**Copilot CLI** reads the same `~/.copilot/hooks/` folder, so the install
+covers it too. It sends Claude-style tool names (`Bash`, `Write`, `Edit`),
+which the gate's list includes, and it reads the decision from the top level
+of the reply, which the gate also writes. Two CLI differences: a hook that
+times out lets the call run, and `ask` is treated as `deny` under the cloud
+agent.
+
 Files for `--target copilot`:
 
 | Path | Change |
