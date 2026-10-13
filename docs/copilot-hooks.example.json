@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "hooks": {
+    "PreToolUse": [
+      {
+        "type": "command",
+        "command": "python C:\Users\YOU\.copilot\jev-gate\jev_gate.py --copilot",
+        "timeout": 20
+      }
+    ]
+  }
+}

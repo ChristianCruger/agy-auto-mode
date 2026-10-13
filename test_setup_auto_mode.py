@@ -523,6 +523,107 @@ class TestJevEngine(InstallerTestCase):
         self.assertTrue(os.path.exists(self.paths.gate_env))
 
 
+class TestCopilotTarget(InstallerTestCase):
+    def setUp(self):
+        super(TestCopilotTarget, self).setUp()
+        with_api_key(self, "sk-test")
+        self.cp = sam.CopilotPaths(copilot_dir=os.path.join(self.root, ".copilot"))
+
+    def install(self, python_cmd=sam.DEFAULT_PYTHON):
+        actions, _ = sam.plan_install_copilot(self.cp, python_cmd)
+        with contextlib.redirect_stdout(io.StringIO()):
+            sam.apply_actions(actions)
+
+    def revert(self):
+        actions, _ = sam.plan_revert_copilot(self.cp)
+        with contextlib.redirect_stdout(io.StringIO()):
+            sam.apply_actions(actions)
+
+    def states(self, **kwargs):
+        return [s for s, _ in sam.check_status_copilot(self.cp, **kwargs)]
+
+    def cli(self, *argv):
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = sam.main(["--target", "copilot", "--copilot-dir", self.cp.copilot_dir]
+                            + list(argv))
+        return code, buffer.getvalue()
+
+    def test_install_writes_hook_gate_and_key(self):
+        self.install()
+        hook = json.loads(self.read(self.cp.hook))
+        self.assertEqual(hook["version"], 1)
+        handler = hook["hooks"]["PreToolUse"][0]
+        self.assertEqual(handler["type"], "command")
+        self.assertIn(self.cp.gate, handler["command"])
+        self.assertTrue(handler["command"].endswith(" --copilot"))
+        self.assertNotIn("matcher", handler)
+        with open(sam.GATE_SOURCE, encoding="utf-8") as handle:
+            self.assertEqual(self.read(self.cp.gate), handle.read())
+        self.assertEqual(self.read(self.cp.gate_env), "TYPESAFE_API_KEY=sk-test\n")
+
+    def test_gate_lives_outside_the_hooks_folder(self):
+        """VS Code reads every file in ~/.copilot/hooks as a hook file."""
+        self.install()
+        hooks_dir = os.path.dirname(self.cp.hook)
+        self.assertEqual(os.listdir(hooks_dir), [os.path.basename(self.cp.hook)])
+
+    def test_agy_config_is_untouched(self):
+        self.install()
+        self.assertFalse(os.path.exists(self.paths.gemini_dir))
+
+    def test_install_is_idempotent(self):
+        self.install()
+        actions, _ = sam.plan_install_copilot(self.cp)
+        self.assertEqual(actions, [])
+
+    def test_revert_leaves_no_files_behind(self):
+        self.install()
+        self.revert()
+        self.assertEqual(self.files(), [])
+
+    def test_other_hook_files_survive(self):
+        other = os.path.join(os.path.dirname(self.cp.hook), "mine.json")
+        self.write(other, '{"hooks": {}}\n')
+        self.install()
+        self.revert()
+        self.assertEqual(self.read(other), '{"hooks": {}}\n')
+
+    def test_existing_key_file_is_kept(self):
+        self.write(self.cp.gate_env, "TYPESAFE_API_KEY=mine\n")
+        self.install()
+        self.revert()
+        self.assertEqual(self.read(self.cp.gate_env), "TYPESAFE_API_KEY=mine\n")
+
+    def test_status_reports_installed_stale_and_python(self):
+        self.assertEqual(self.states(), [sam.MISSING] * 3)
+        self.install(python_cmd="py -3")
+        self.assertEqual(self.states(), [sam.OK, sam.OK, sam.OK])
+        self.assertEqual(self.states(python_cmd="python")[0], sam.STALE)
+        self.write(self.cp.gate, "# edited\n")
+        self.assertEqual(self.states()[1], sam.STALE)
+
+    def test_cli_install_status_revert(self):
+        self.assertEqual(self.cli()[0], 0)
+        code, output = self.cli("--status")
+        self.assertEqual(code, 0)
+        self.assertIn("Copilot", output)
+        self.assertEqual(self.cli("--revert")[0], 0)
+        self.assertEqual(self.cli("--status")[0], 1)
+        self.assertEqual(self.files(), [])
+
+    def test_cli_dry_run_changes_nothing(self):
+        code, output = self.cli("--dry-run")
+        self.assertEqual(code, 0)
+        self.assertIn("Dry run", output)
+        self.assertEqual(self.files(), [])
+
+    def test_subagent_engine_is_refused(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.cli("--engine", "subagent")[0], 1)
+        self.assertEqual(self.files(), [])
+
+
 class TestHardenedPrompts(InstallerTestCase):
     """The reviewer's output is parsed by the model that wants to run the
     command, so the prompts have to say so explicitly."""
