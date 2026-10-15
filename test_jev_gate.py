@@ -229,6 +229,24 @@ def copilot_event(name="run_in_terminal", tool_input=None, cwd="/w"):
 
 
 class CopilotTestCase(unittest.TestCase):
+    def setUp(self):
+        root = tempfile.mkdtemp(prefix="jev-gate-test-")
+        self.addCleanup(shutil.rmtree, root, True)
+        state = os.path.join(root, "rethink-state.json")
+        for key, value in (("JEV_GATE_STATE_FILE", state), ("JEV_GATE_RETHINK", None)):
+            self.addCleanup(self._restore_env, key, os.environ.get(key))
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    @staticmethod
+    def _restore_env(key, value):
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
     def run_main(self, raw, asker=None):
         out = io.StringIO()
         original = gate.ask_jev
@@ -267,16 +285,83 @@ class CopilotTestCase(unittest.TestCase):
         # Copilot CLI reads the top-level copy.
         self.assertEqual(out["permissionDecision"], "allow")
         self.assertEqual(out["permissionDecisionReason"], hso["permissionDecisionReason"])
+        self.assertNotIn("additionalContext", hso)
 
     def test_deny_maps_to_deny(self):
         _, out = self.run_main(json.dumps(copilot_event()),
                                lambda s: answers(destructive=0.95))
-        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        hso = out["hookSpecificOutput"]
+        self.assertEqual(hso["permissionDecision"], "deny")
+        self.assertIn("safer way", hso["additionalContext"])
+        self.assertIn("safer way", out["permissionDecisionReason"])
 
-    def test_force_ask_maps_to_ask(self):
+    def test_force_ask_maps_to_ask_when_rethink_is_off(self):
+        os.environ["JEV_GATE_RETHINK"] = "0"
         _, out = self.run_main(json.dumps(copilot_event()),
                                lambda s: answers(destructive=0.5))
         self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "ask")
+
+    def test_force_ask_goes_back_to_the_agent_first(self):
+        _, out = self.run_main(json.dumps(copilot_event()),
+                               lambda s: answers(destructive=0.5))
+        hso = out["hookSpecificOutput"]
+        self.assertEqual(hso["permissionDecision"], "deny")
+        self.assertIn("same call again", hso["additionalContext"])
+        self.assertIn("cannot be recovered", hso["additionalContext"])
+
+    def test_repeated_call_is_asked_without_calling_jev(self):
+        self.run_main(json.dumps(copilot_event()), lambda s: answers(destructive=0.5))
+        called = []
+        # The agent rewrites the explanation, and the call has a new id.
+        repeat = copilot_event(tool_input={"command": "pytest -q", "explanation": "again",
+                                           "isBackground": False})
+        repeat["tool_use_id"] = "t2"
+        _, out = self.run_main(json.dumps(repeat),
+                               lambda s: called.append(s) or answers())
+        hso = out["hookSpecificOutput"]
+        self.assertEqual(hso["permissionDecision"], "ask")
+        self.assertIn("cannot be recovered", hso["permissionDecisionReason"])
+        self.assertEqual(called, [])
+        # Asked once; a third attempt is judged afresh.
+        _, out = self.run_main(json.dumps(repeat), lambda s: answers())
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "allow")
+
+    def test_a_different_call_is_not_a_repeat(self):
+        self.run_main(json.dumps(copilot_event()), lambda s: answers(destructive=0.5))
+        other = copilot_event(tool_input={"command": "pytest -q -x"})
+        _, out = self.run_main(json.dumps(other), lambda s: answers())
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "allow")
+
+    def test_other_session_is_not_a_repeat(self):
+        self.run_main(json.dumps(copilot_event()), lambda s: answers(destructive=0.5))
+        other = copilot_event()
+        other["session_id"] = "s2"
+        _, out = self.run_main(json.dumps(other), lambda s: answers(destructive=0.5))
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_unwritable_state_asks_the_user_at_once(self):
+        """If a repeat cannot be recognised, sending back would loop."""
+        os.environ["JEV_GATE_STATE_FILE"] = os.path.join(
+            os.environ["JEV_GATE_STATE_FILE"], "no", "such", "dir", "s.json")
+        _, out = self.run_main(json.dumps(copilot_event()),
+                               lambda s: answers(destructive=0.5))
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "ask")
+
+    def test_expired_entry_is_judged_afresh(self):
+        key = gate.call_key(copilot_event())
+        path = os.environ["JEV_GATE_STATE_FILE"]
+        gate.remember_rethink(key, "old", path=path, now=0)
+        self.assertIsNone(gate.take_rethink(key, path=path, now=gate.RETHINK_TTL + 1))
+
+    def test_state_names_the_temp_folder(self):
+        state = gate.build_state(copilot_event(), gate.TARGET_COPILOT)
+        self.assertTrue(state["temp_dir"])
+
+    def test_pylance_snippet_is_judged(self):
+        for name in ("mcp_pylance_mcp_s_pylanceRunCodeSnippet", "pylanceRunCodeSnippet"):
+            self.assertTrue(gate.is_guarded(name, gate.COPILOT_GUARDED_TOOLS), name)
+        self.assertFalse(gate.is_guarded("mcp_pylance_mcp_s_pylancePythonEnvironments",
+                                         gate.COPILOT_GUARDED_TOOLS))
 
     def test_unguarded_tool_gives_no_decision(self):
         """A read must reach Copilot's own approval, not a prompt from us."""
@@ -291,6 +376,8 @@ class CopilotTestCase(unittest.TestCase):
         code, out = self.run_main("not json")
         self.assertEqual(code, 0)
         self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        # No "safer way" advice: nothing was judged.
+        self.assertNotIn("additionalContext", out["hookSpecificOutput"])
 
     def test_missing_cwd_asks(self):
         _, out = self.run_main(json.dumps(copilot_event(cwd=None)), lambda s: answers())

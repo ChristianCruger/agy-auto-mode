@@ -30,7 +30,11 @@ Copilot contract, with --copilot (VS Code agent hooks, a preview feature):
 * Output: {"hookSpecificOutput": {"hookEventName": "PreToolUse",
   "permissionDecision": allow|deny|ask, "permissionDecisionReason": ...}}.
   agy's "ask" means "normal permission handling", so it becomes an empty
-  object; agy's "force_ask" becomes Copilot's "ask".
+  object; agy's "force_ask" becomes Copilot's "ask". A deny carries
+  additionalContext, which VS Code gives to the model.
+* A force_ask is first sent back to the agent as a deny that asks for a safer
+  way. The same call again within RETHINK_TTL goes to the user. Set
+  JEV_GATE_RETHINK=0 to ask the user at once.
 * Exit code 2 blocks the call; any other non-zero code is only a warning, so
   a crash in --copilot mode exits 2.
 * Copilot CLI reads the same ~/.copilot/hooks files. It documents the
@@ -117,6 +121,10 @@ COPILOT_GUARDED_TOOLS = (
     "write",
     "multi_edit",
     "notebook_edit",
+    # Pylance's MCP tool runs a Python snippet in the workspace interpreter.
+    # The prefix comes from the MCP server name, so both spellings are listed.
+    "mcp_pylance_mcp_s_pylanceRunCodeSnippet",
+    "pylanceRunCodeSnippet",
 )
 
 TARGET_AGY = "agy"
@@ -135,20 +143,28 @@ ENV_FILE_NAME = "jev_gate.env"
 HAZARDS = {
     "escapes_workspace": {
         "instructions": (
-            "Does this action write to, move, or delete a path that resolves outside "
-            "`workspace_root`? When `workspace_root` is a list, a path inside any of "
-            "them is in bounds. Resolve `..`, `~`, environment variables, and "
-            "relative paths against `cwd` before deciding."
+            # "Names, in its own arguments": asked about side effects it cannot
+            # see, such as a test run's temp files, Jev guessed near the ask
+            # threshold for every pytest call.
+            "Does this action name, in its own arguments, a path outside "
+            "`workspace_root` and outside `temp_dir` that it writes to, moves, or "
+            "deletes? Resolve `..`, `~`, environment variables, and relative paths "
+            "against `cwd`. When `workspace_root` is a list, a path inside any of "
+            "them is in bounds."
         ),
         "criteria": {
             "true": (
-                "At least one write, move, or delete target lies outside workspace_root. "
-                "Also true when workspace_root is empty or missing, because then the "
-                "boundary cannot be established at all."
+                "At least one write, move, or delete target lies outside both "
+                "workspace_root and temp_dir. Also true when workspace_root is empty "
+                "or missing, because then the boundary cannot be established at all."
             ),
             "false": (
-                "Every write, move, and delete target resolves inside workspace_root. "
-                "Reading a file outside the workspace is not a write and is false here."
+                "Every write, move, and delete target that the action names resolves "
+                "inside workspace_root or temp_dir, or the action names no write "
+                "target at all. Files that a program, test suite, build or tool "
+                "writes for itself as a side effect (caches, temp files, logs, output "
+                "in temp_dir) do not count. Reading a file outside the workspace is "
+                "not a write and is false here."
             ),
         },
     },
@@ -187,7 +203,8 @@ HAZARDS = {
             ),
             "false": (
                 "Package installs into the project's own environment, such as a "
-                "virtualenv, node_modules, or a lockfile-driven install."
+                "virtualenv, node_modules, or a lockfile-driven install. Temporary "
+                "files under temp_dir."
             ),
         },
     },
@@ -488,33 +505,159 @@ def build_state(event, target=TARGET_AGY):
     cwd = cwd or _first(event, "cwd") or (roots[0] if roots else "")
     return {
         "workspace_root": roots[0] if len(roots) == 1 else roots if roots else "",
+        "temp_dir": temp_dir(),
         "cwd": cwd,
         "tool": tool_name(event),
         "arguments": args if args is not None else "",
     }
 
 
+def temp_dir():
+    """The system temp folder, from the environment. tempfile costs an import."""
+    return _first(os.environ, "TEMP", "TMP", "TMPDIR") or "/tmp"
+
+
+# --- sending a call back before asking ------------------------------------
+#
+# A "force_ask" first goes back to the agent as a deny that tells it to look
+# for a safer way. If the agent sends the same call again, the user is asked.
+# The memory is a small JSON file next to the gate: {key: [time, reason]}.
+
+#: How long, in seconds, a call sent back stays remembered.
+RETHINK_TTL = 3600
+
+#: Tool input fields that describe the call rather than make it. An agent
+#: rewrites these when it repeats a call, so they are not part of the key.
+DESCRIPTIVE_FIELDS = ("explanation", "goal", "description", "intent")
+
+
+def rethink_enabled():
+    return os.environ.get("JEV_GATE_RETHINK", "1").strip().lower() not in ("0", "off", "false", "no")
+
+
+def _rethink_path():
+    return os.environ.get("JEV_GATE_STATE_FILE") or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "rethink-state.json"
+    )
+
+
+def call_key(event):
+    """Identify a call across attempts: same session, tool and effective input."""
+    import hashlib
+
+    args = tool_args(event)
+    if isinstance(args, dict):
+        args = {k: v for k, v in args.items() if k not in DESCRIPTIVE_FIELDS}
+    session = _first(event, "session_id", "sessionId", "conversationId")
+    raw = json.dumps([session, _norm(tool_name(event)), args], sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _load_rethink(path, now):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {k: v for k, v in data.items()
+            if isinstance(v, list) and len(v) == 2 and now - v[0] < RETHINK_TTL}
+
+
+def _save_rethink(path, data):
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(data, handle)
+    os.replace(tmp, path)
+
+
+def take_rethink(key, path=None, now=None):
+    """The reason this call was sent back, if it was. Forgets it."""
+    import time
+
+    path = path or _rethink_path()
+    now = time.time() if now is None else now
+    data = _load_rethink(path, now)
+    entry = data.pop(key, None)
+    if entry is None:
+        return None
+    try:
+        _save_rethink(path, data)
+    except OSError:
+        pass
+    return entry[1]
+
+
+def remember_rethink(key, reason, path=None, now=None):
+    """Record a call sent back. False if it cannot be recorded."""
+    import time
+
+    path = path or _rethink_path()
+    now = time.time() if now is None else now
+    data = _load_rethink(path, now)
+    data[key] = [now, reason]
+    try:
+        _save_rethink(path, data)
+    except OSError:
+        return False
+    return True
+
+
 #: agy decision -> Copilot permissionDecision. None means no opinion: the tool
-#: goes through Copilot's own approval, as agy's "ask" does in agy.
-COPILOT_DECISIONS = {"allow": "allow", "deny": "deny", "force_ask": "ask", "ask": None}
+#: goes through Copilot's own approval, as agy's "ask" does in agy. "rethink"
+#: is a force_ask sent back to the agent first.
+COPILOT_DECISIONS = {"allow": "allow", "deny": "deny", "force_ask": "ask", "ask": None,
+                     "rethink": "deny"}
+
+#: What the model reads with a decision, as additionalContext.
+COPILOT_CONTEXT = {
+    "deny": (
+        "The Jev safety gate blocked this tool call: {reason}. Do not repeat it, "
+        "and do not work around the gate. Look for a safer way to reach the same "
+        "goal, for example one that keeps every write inside the workspace or the "
+        "temp folder. If there is no safer way, stop and tell the user what you "
+        "need and why."
+    ),
+    "rethink": (
+        "The Jev safety gate sent this tool call back before it asks the user: "
+        "{reason}. First consider whether a safer way gives the same result, for "
+        "example one that keeps every write inside the workspace or the temp "
+        "folder, reads instead of writes, or changes less. If there is one, use it "
+        "instead. If there is no safer way, make the same call again with the same "
+        "input, and the gate will ask the user to approve it."
+    ),
+}
 
 
-def emit(decision, reason, stream=None, target=TARGET_AGY):
-    """Print the decision in the shape the target's PreToolUse contract expects."""
+def emit(decision, reason, stream=None, target=TARGET_AGY, judged=False):
+    """Print the decision in the shape the target's PreToolUse contract expects.
+
+    judged: Jev assessed the call. Only then is "find a safer way" useful
+    advice; a deny for an unreadable event or a failed review gets none.
+    """
     stream = stream or sys.stdout
+    context = COPILOT_CONTEXT.get(decision, "").format(reason=reason) if judged else ""
+    if decision == "rethink":
+        reason += "; sent back to the agent to look for a safer way first"
     reason = "Jev gate: " + reason
     if target == TARGET_COPILOT:
         mapped = COPILOT_DECISIONS.get(decision, "deny")
         payload = {}
         if mapped is not None:
             # VS Code reads the nested form, Copilot CLI the top-level one.
+            # VS Code shows the reason to the user and gives additionalContext
+            # to the model. The CLI has no additionalContext, so its copy of
+            # the reason carries the guidance.
             payload["permissionDecision"] = mapped
-            payload["permissionDecisionReason"] = reason
+            payload["permissionDecisionReason"] = reason + (" " + context if context else "")
             payload["hookSpecificOutput"] = {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": mapped,
                 "permissionDecisionReason": reason,
             }
+            if context:
+                payload["hookSpecificOutput"]["additionalContext"] = context
     else:
         payload = {"decision": decision, "reason": reason}
     json.dump(payload, stream)
@@ -593,6 +736,16 @@ def review(event, policy=None, asker=None, target=TARGET_AGY):
         # The old prompt returned CAUTION here. In code it can be stricter:
         # without a root there is no boundary, so no path claim can be checked.
         return "force_ask", "no workspace root was supplied, so the boundary is unknown", {}
+    rethink = target == TARGET_COPILOT and rethink_enabled()
+    key = call_key(event) if rethink else None
+    if rethink:
+        earlier = take_rethink(key)
+        if earlier is not None:
+            # The agent found no safer way and repeated the call: ask the user,
+            # with the reason Jev gave the first time.
+            reason = earlier + "; repeated after a request for a safer way"
+            audit({"state": state, "decision": "force_ask", "reason": reason})
+            return "force_ask", reason, {}
     try:
         answers = asker(state)
     except Exception as exc:  # noqa: BLE001 - every failure must fail closed
@@ -601,6 +754,9 @@ def review(event, policy=None, asker=None, target=TARGET_AGY):
             exc,
         ), {}
     decision, reason, detail = decide(answers, policy)
+    if decision == "force_ask" and rethink and remember_rethink(key, reason):
+        # Only when the repeat can be recognised; else the agent would loop.
+        decision = "rethink"
     audit({"state": state, "answers": answers, "decision": decision, "reason": reason})
     return decision, reason, detail
 
@@ -657,7 +813,7 @@ def _main(argv, stdin, stdout, target):
         )
         stdout.write("\n")
     else:
-        emit(decision, reason, stdout, target)
+        emit(decision, reason, stdout, target, judged=bool(detail))
     return 0
 
 
