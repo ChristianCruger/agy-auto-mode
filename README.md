@@ -1,6 +1,6 @@
 # agy-auto-mode
 
-An "auto-mode" for the Google Antigravity CLI and IDE extension (`agy`): the
+An "auto-mode" for the Github Copilot and Google Antigravity CLI and IDE extension (`agy`): the
 agent keeps working without a confirmation prompt for routine work, and a
 safety check looks at each state-changing tool call first.
 
@@ -123,18 +123,30 @@ Copilot.
 What is different from agy:
 
 - **The hook gets every tool call.** VS Code hooks have no matcher, so the
-  gate starts for reads too. It answers those within a fraction of a second
-  without calling Jev, and gives no decision, so VS Code's own approval
-  applies to them.
+  gate starts for reads too. It answers those without calling Jev, and gives
+  no decision, so VS Code's own approval applies to them. On Windows, VS Code
+  starts every hook through Windows PowerShell, which adds about 1.4 s to
+  each tool call, reads included. The gate itself takes about 0.25 s. No hook
+  setting changes the shell.
 - **Tool names are matched loosely.** VS Code does not document its tool
   names, and releases spell them differently (`run_in_terminal`,
   `runInTerminal`). The gate ignores case, underscores and dashes. The list
   is `COPILOT_GUARDED_TOOLS` in `jev_gate.py`. With `JEV_GATE_AUDIT_LOG` set,
   calls the gate does not judge are logged as well, so you can see the names
-  your version sends and add any that change state.
+  your version sends and add any that change state. Pylance's
+  `pylanceRunCodeSnippet` is on the list, because it runs Python code.
 - **Decisions map as follows:** `allow` → `allow`, `force_ask` → `ask`,
   `deny` → `deny`. A crash in the gate exits with code 2, which makes VS Code
   block the call; any other exit code would only be a warning.
+- **An `ask` goes back to the agent first.** The gate denies the call and
+  tells the agent, through `additionalContext`, to look for a safer way. If
+  the agent sends the same call again within an hour, the gate asks you, with
+  the first reason. Changes to the call's `explanation` or `goal` do not
+  count. Set `JEV_GATE_RETHINK=0` in `jev_gate.env` to ask at once. A `deny`
+  also tells the agent to find a safer way, or to stop and tell you.
+- **The system temp folder counts as inside the workspace.** Files that a
+  test run or a build writes for itself, such as temp files and caches, do
+  not count as writes outside it.
 - **The workspace root is the hook's `cwd`.** With no `cwd`, the gate asks.
 - **The auto-approve settings are not changed.** The gate's `allow` is what
   removes the prompt for routine work. If you turn on VS Code's global
@@ -159,6 +171,7 @@ Files for `--target copilot`:
 | `~/.copilot/jev-gate/jev_gate.py` | Copy of the gate (rewritten on reinstall) |
 | `~/.copilot/jev-gate/jev_gate.env` | Your API key, only if absent and the key is in the environment |
 | `~/.copilot/jev-gate/install-state.json` | Records which files the installer created |
+| `~/.copilot/jev-gate/rethink-state.json` | Written by the gate: calls it sent back to the agent |
 
 The gate sits outside `~/.copilot/hooks/` because VS Code reads every JSON
 file in that folder as a hook file. `--copilot-dir DIR` (or

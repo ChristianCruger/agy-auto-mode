@@ -203,6 +203,8 @@ class CopilotPaths:
         self.gate = os.path.join(self.gate_dir, "jev_gate.py")
         self.gate_env = os.path.join(self.gate_dir, "jev_gate.env")
         self.state = os.path.join(self.gate_dir, "install-state.json")
+        # Written by the gate itself: calls it sent back for a safer way.
+        self.rethink = os.path.join(self.gate_dir, "rethink-state.json")
 
 
 class Action:
@@ -589,6 +591,8 @@ def plan_revert_copilot(paths):
                                   message=" [-] Removed key file: {}".format(paths.gate_env)))
         else:
             notes.append(" [=] Kept your key file: {}".format(paths.gate_env))
+    if os.path.exists(paths.rethink):
+        actions.append(Action("remove", paths.rethink, message=None))
     if os.path.exists(paths.state):
         actions.append(Action("remove", paths.state, message=None))
 

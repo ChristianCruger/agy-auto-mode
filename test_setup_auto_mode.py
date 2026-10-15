@@ -582,6 +582,12 @@ class TestCopilotTarget(InstallerTestCase):
         self.revert()
         self.assertEqual(self.files(), [])
 
+    def test_revert_removes_the_gates_own_state(self):
+        self.install()
+        self.write(self.cp.rethink, "{}\n")
+        self.revert()
+        self.assertEqual(self.files(), [])
+
     def test_other_hook_files_survive(self):
         other = os.path.join(os.path.dirname(self.cp.hook), "mine.json")
         self.write(other, '{"hooks": {}}\n')
