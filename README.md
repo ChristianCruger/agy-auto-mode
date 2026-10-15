@@ -1,6 +1,6 @@
 # agy-auto-mode
 
-An "auto-mode" for the Google Antigravity CLI and IDE extension (`agy`): the
+An "auto-mode" for the Github Copilot and Google Antigravity CLI and IDE extension (`agy`): the
 agent keeps working without a confirmation prompt for routine work, and a
 safety check looks at each state-changing tool call first.
 
